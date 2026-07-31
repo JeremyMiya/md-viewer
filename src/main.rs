@@ -12,11 +12,14 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
-use egui_commonmark_extended::{CommonMarkCache, CommonMarkViewer, STRONG_FONT_FAMILY};
+use egui_commonmark_extended::{CommonMarkCache, CommonMarkViewer};
 use notify::{PollWatcher, RecommendedWatcher};
 use notify_debouncer_mini::{new_debouncer, new_debouncer_opt, DebouncedEventKind, Debouncer};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+mod system_fonts;
+use system_fonts::setup_fonts;
 
 #[cfg(feature = "mcp")]
 use egui_mcp_bridge::{McpBridge, McpUiExt};
@@ -33,105 +36,6 @@ static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})\s+(.
 /// Compiled regex for parsing markdown links (lazy, compiled once)
 static LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]*)\]\(([^)]+)\)").unwrap());
 
-/// System font paths for a real bold face used by Markdown strong text.
-const STRONG_FONT_PATHS: &[&str] = &[
-    "/usr/share/fonts/noto/NotoSans-Bold.ttf",
-    "/usr/share/fonts/TTF/NotoSans-Bold.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-];
-
-/// System font paths for fallback (Linux and Windows common paths)
-const SYSTEM_FONT_PATHS: &[(&str, &str)] = &[
-    // Noto Sans for extended Latin, Greek, Cyrillic
-    ("NotoSans", "/usr/share/fonts/noto/NotoSans-Regular.ttf"),
-    ("NotoSans", "/usr/share/fonts/TTF/NotoSans-Regular.ttf"),
-    (
-        "NotoSans",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-    ),
-    // Linux CJK fonts (Chinese, Japanese, Korean)
-    (
-        "NotoSansCJK",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-    ),
-    (
-        "NotoSansCJK",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    ),
-    (
-        "NotoSansCJK",
-        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-    ),
-    // Windows CJK fonts (Chinese, Japanese, Korean)
-    ("MicrosoftYaHei", "C:/Windows/Fonts/msyh.ttc"),
-    ("MicrosoftYaHeiUI", "C:/Windows/Fonts/msyh.ttc"),
-    ("SimSun", "C:/Windows/Fonts/simsun.ttc"),
-    ("NSimSun", "C:/Windows/Fonts/simsun.ttc"),
-    ("DengXian", "C:/Windows/Fonts/Deng.ttf"),
-    ("MicrosoftJhengHei", "C:/Windows/Fonts/msjh.ttc"),
-    ("YuGothic", "C:/Windows/Fonts/YuGothM.ttc"),
-    ("MalgunGothic", "C:/Windows/Fonts/malgun.ttf"),
-    // Arabic
-    (
-        "NotoSansArabic",
-        "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
-    ),
-    (
-        "NotoSansArabic",
-        "/usr/share/fonts/TTF/NotoSansArabic-Regular.ttf",
-    ),
-    // Hebrew
-    (
-        "NotoSansHebrew",
-        "/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf",
-    ),
-    (
-        "NotoSansHebrew",
-        "/usr/share/fonts/TTF/NotoSansHebrew-Regular.ttf",
-    ),
-    // Devanagari (Hindi, Sanskrit)
-    (
-        "NotoSansDevanagari",
-        "/usr/share/fonts/noto/NotoSansDevanagari-Regular.ttf",
-    ),
-    (
-        "NotoSansDevanagari",
-        "/usr/share/fonts/TTF/NotoSansDevanagari-Regular.ttf",
-    ),
-    // Thai
-    (
-        "NotoSansThai",
-        "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
-    ),
-    (
-        "NotoSansThai",
-        "/usr/share/fonts/TTF/NotoSansThai-Regular.ttf",
-    ),
-    // Symbols (math, arrows, etc.)
-    (
-        "NotoSansSymbols",
-        "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
-    ),
-    (
-        "NotoSansSymbols",
-        "/usr/share/fonts/TTF/NotoSansSymbols-Regular.ttf",
-    ),
-    (
-        "NotoSansSymbols2",
-        "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
-    ),
-    (
-        "NotoSansSymbols2",
-        "/usr/share/fonts/TTF/NotoSansSymbols2-Regular.ttf",
-    ),
-    // DejaVu Sans - covers warning sign (U+26A0) and other misc symbols
-    ("DejaVuSans", "/usr/share/fonts/TTF/DejaVuSans.ttf"),
-    ("DejaVuSans", "/usr/share/fonts/dejavu/DejaVuSans.ttf"),
-    (
-        "DejaVuSans",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ),
-];
 const MAX_WATCHER_RETRIES: u32 = 3;
 const FLASH_DURATION_MS: u64 = 600;
 
@@ -1181,123 +1085,6 @@ fn any_header_has_children(headers: &[Header]) -> bool {
         }
     }
     false
-}
-
-/// Register a named bold font family for Markdown strong text.
-fn setup_strong_font_family(fonts: &mut egui::FontDefinitions) {
-    let mut strong_family = Vec::new();
-
-    // Try to load a true bold face before appending proportional fallbacks.
-    for font_path in STRONG_FONT_PATHS {
-        let path = Path::new(font_path);
-        if path.exists() {
-            match fs::read(path) {
-                Ok(font_data) => {
-                    log::info!("Loaded Markdown strong font: {}", font_path);
-                    fonts.font_data.insert(
-                        STRONG_FONT_FAMILY.to_string(),
-                        egui::FontData::from_owned(font_data).into(),
-                    );
-                    strong_family.push(STRONG_FONT_FAMILY.to_string());
-                    break;
-                }
-                Err(e) => {
-                    log::debug!("Failed to read Markdown strong font {}: {}", font_path, e);
-                }
-            }
-        }
-    }
-
-    // Keep normal proportional fallbacks so bold text can still render broad Unicode.
-    if let Some(proportional) = fonts.families.get(&egui::FontFamily::Proportional) {
-        strong_family.extend(
-            proportional
-                .iter()
-                .filter(|font_name| font_name.as_str() != STRONG_FONT_FAMILY)
-                .cloned(),
-        );
-    }
-
-    if !matches!(
-        strong_family.first(),
-        Some(font_name) if font_name.as_str() == STRONG_FONT_FAMILY
-    ) {
-        log::warn!("No Markdown strong font found. Install NotoSans-Bold for true bold rendering.");
-    }
-
-    // The renderer selects this named family for strong spans; register it even
-    // without a bold face so documents do not panic on systems missing Noto Sans Bold.
-    fonts.families.insert(
-        egui::FontFamily::Name(STRONG_FONT_FAMILY.into()),
-        strong_family,
-    );
-}
-
-/// Setup custom fonts with system font fallbacks for Unicode support.
-/// Loads Noto fonts from system for extended character coverage.
-fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    let mut loaded_fonts: HashSet<String> = HashSet::new();
-
-    // Try to load each font from its possible paths
-    for (font_name, font_path) in SYSTEM_FONT_PATHS {
-        // Skip if we already loaded this font
-        if loaded_fonts.contains(*font_name) {
-            continue;
-        }
-
-        let path = Path::new(font_path);
-        if path.exists() {
-            match fs::read(path) {
-                Ok(font_data) => {
-                    log::info!("Loaded font fallback: {} from {}", font_name, font_path);
-
-                    fonts.font_data.insert(
-                        font_name.to_string(),
-                        egui::FontData::from_owned(font_data).into(),
-                    );
-
-                    // Noto Sans is the primary body face so regular text shares the
-                    // Noto Sans family — and its baseline/ascent metrics — with the
-                    // Noto Sans Bold used for `**strong**` (issue #39). Otherwise
-                    // regular text stays on egui's bundled Ubuntu-Light and bold spans
-                    // sit on a slightly different baseline. Other scripts (CJK, Arabic,
-                    // …) remain appended fallbacks.
-                    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                        if *font_name == "NotoSans" {
-                            family.insert(0, font_name.to_string());
-                        } else {
-                            family.push(font_name.to_string());
-                        }
-                    }
-
-                    // Also add text fonts to monospace for code blocks with Unicode
-                    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                        family.push(font_name.to_string());
-                    }
-
-                    loaded_fonts.insert(font_name.to_string());
-                }
-                Err(e) => {
-                    log::debug!("Failed to read font {}: {}", font_path, e);
-                }
-            }
-        }
-    }
-
-    if loaded_fonts.is_empty() {
-        log::warn!("No system fonts loaded. Unicode characters may show as red triangles.");
-        log::warn!("Install noto-fonts and noto-fonts-cjk for full Unicode support.");
-    } else {
-        log::info!(
-            "Loaded {} font fallbacks for Unicode support",
-            loaded_fonts.len()
-        );
-    }
-
-    setup_strong_font_family(&mut fonts);
-
-    ctx.set_fonts(fonts);
 }
 
 #[global_allocator]
