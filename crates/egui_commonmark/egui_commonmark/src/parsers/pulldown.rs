@@ -1835,7 +1835,15 @@ impl CommonMarkViewerInternal {
             }
             pulldown_cmark::TagEnd::Link => {
                 if let Some(link) = self.link.take() {
-                    link.end(ui, cache);
+                    // A linked image has already rendered its image widget and
+                    // leaves no text in the surrounding Link. Rendering an
+                    // empty Label here resets egui's wrapped-row cursor to the
+                    // row start, so the next inline image is painted on top of
+                    // the previous one. Empty links have no visible widget to
+                    // render; keep the cursor where the image left it.
+                    if !link.text.is_empty() {
+                        link.end(ui, cache);
+                    }
                 }
             }
             pulldown_cmark::TagEnd::Image => {
@@ -2415,5 +2423,45 @@ mod tests {
     fn image_alt_text_and_url_remain_literal() {
         let markdown = "![:pushpin:](https://e/:rocket:.png)";
         assert_eq!(expanded_visible_text(markdown), ":pushpin:");
+    }
+
+    #[test]
+    fn ending_linked_image_keeps_wrapped_row_cursor_after_image() {
+        egui::__run_test_ui(|ui| {
+            let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
+            ui.allocate_ui_with_layout(egui::vec2(400.0, 0.0), layout, |ui| {
+                let mut renderer = CommonMarkViewerInternal::new();
+                let mut cache = CommonMarkCache::default();
+                let options = CommonMarkOptions::default();
+
+                renderer.link = Some(crate::Link {
+                    destination: "https://example.com".to_string(),
+                    text: Vec::new(),
+                });
+                renderer.image = Some(crate::Image::new(
+                    "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>",
+                    &options,
+                ));
+
+                renderer.end_tag(
+                    ui,
+                    pulldown_cmark::TagEnd::Image,
+                    &mut cache,
+                    &options,
+                    400.0,
+                );
+                let cursor_after_image = ui.next_widget_position();
+
+                renderer.end_tag(
+                    ui,
+                    pulldown_cmark::TagEnd::Link,
+                    &mut cache,
+                    &options,
+                    400.0,
+                );
+
+                assert_eq!(ui.next_widget_position(), cursor_after_image);
+            });
+        });
     }
 }

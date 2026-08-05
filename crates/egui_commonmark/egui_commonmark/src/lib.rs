@@ -74,6 +74,8 @@
 
 use egui::{self, Id};
 
+#[cfg(feature = "svg")]
+mod mime_svg_loader;
 mod parsers;
 
 pub use egui_commonmark_backend_extended::RenderHtmlFn;
@@ -95,6 +97,12 @@ pub use egui_commonmark_macros_extended::*;
 pub use egui_commonmark_backend_extended;
 
 use egui_commonmark_backend_extended::*;
+
+fn prepare_show(cache: &mut CommonMarkCache, ctx: &egui::Context) {
+    egui_commonmark_backend_extended::prepare_show(cache, ctx);
+    #[cfg(feature = "svg")]
+    mime_svg_loader::install(ctx);
+}
 
 #[derive(Debug, Default)]
 pub struct CommonMarkViewer<'f> {
@@ -437,7 +445,7 @@ impl<'f> CommonMarkViewer<'f> {
         cache: &mut CommonMarkCache,
         text: &str,
     ) -> egui::InnerResponse<()> {
-        egui_commonmark_backend_extended::prepare_show(cache, ui.ctx());
+        prepare_show(cache, ui.ctx());
 
         let (response, _) = parsers::pulldown::CommonMarkViewerInternal::new().show(
             ui,
@@ -460,7 +468,7 @@ impl<'f> CommonMarkViewer<'f> {
         text: &mut String,
     ) -> egui::InnerResponse<()> {
         self.options.mutable = true;
-        egui_commonmark_backend_extended::prepare_show(cache, ui.ctx());
+        prepare_show(cache, ui.ctx());
 
         let (mut inner_response, checkmark_events) =
             parsers::pulldown::CommonMarkViewerInternal::new().show(
@@ -509,7 +517,7 @@ impl<'f> CommonMarkViewer<'f> {
         cache: &mut CommonMarkCache,
         text: &str,
     ) -> egui::scroll_area::ScrollAreaOutput<()> {
-        egui_commonmark_backend_extended::prepare_show(cache, ui.ctx());
+        prepare_show(cache, ui.ctx());
         parsers::pulldown::CommonMarkViewerInternal::new().show_scrollable(
             Id::new(source_id),
             ui,
