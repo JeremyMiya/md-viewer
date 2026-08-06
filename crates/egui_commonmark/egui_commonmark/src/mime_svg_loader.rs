@@ -30,7 +30,7 @@ impl Default for MimeSvgLoader {
         let options = {
             let mut options = options;
             options.fontdb_mut().load_system_fonts();
-            repair_generic_font_families(options.fontdb_mut());
+            repair_sans_serif_family(options.fontdb_mut());
             options
         };
         Self {
@@ -40,93 +40,36 @@ impl Default for MimeSvgLoader {
     }
 }
 
-/// fontdb reads generic-family aliases from fontconfig configuration files,
-/// but an alias may name a font that is not installed (for example FreeSans on
-/// a minimal Linux desktop). Validate the aliases and, when necessary, ask the
-/// system's fontconfig matcher for a concrete installed family. The final scan
-/// keeps SVG text working on systems without the `fc-match` utility.
+/// fontdb may map the generic sans-serif family to a font that is not installed.
+/// Preserve valid mappings and otherwise ask Fontconfig for the concrete system
+/// sans-serif family used by SVG badges.
 #[cfg(feature = "svg_text")]
-fn repair_generic_font_families(database: &mut Database) {
-    let serif = resolve_generic_family(
-        database,
-        database.family_name(&Family::Serif),
-        "serif",
-        "serif",
-        false,
-    );
-    let sans_serif = resolve_generic_family(
-        database,
-        database.family_name(&Family::SansSerif),
-        "sans-serif",
-        "sans",
-        false,
-    );
-    let monospace = resolve_generic_family(
-        database,
-        database.family_name(&Family::Monospace),
-        "monospace",
-        "mono",
-        true,
-    );
-
-    if let Some(family) = serif {
-        database.set_serif_family(family);
+fn repair_sans_serif_family(database: &mut Database) {
+    if family_is_loaded(database, database.family_name(&Family::SansSerif)) {
+        return;
     }
-    if let Some(family) = sans_serif {
+
+    if let Some(family) =
+        fontconfig_sans_serif_family().filter(|family| family_is_loaded(database, family))
+    {
         database.set_sans_serif_family(family);
     }
-    if let Some(family) = monospace {
-        database.set_monospace_family(family);
-    }
 }
 
 #[cfg(feature = "svg_text")]
-fn resolve_generic_family(
-    database: &Database,
-    configured: &str,
-    fontconfig_pattern: &str,
-    preferred_name_fragment: &str,
-    monospaced: bool,
-) -> Option<String> {
-    canonical_family_name(database, configured)
-        .or_else(|| {
-            fontconfig_family(fontconfig_pattern)
-                .and_then(|family| canonical_family_name(database, &family))
-        })
-        .or_else(|| fallback_family_name(database, preferred_name_fragment, monospaced))
-}
-
-#[cfg(feature = "svg_text")]
-fn canonical_family_name(database: &Database, requested: &str) -> Option<String> {
-    database.faces().find_map(|face| {
+fn family_is_loaded(database: &Database, requested: &str) -> bool {
+    database.faces().any(|face| {
         face.families
             .iter()
-            .find(|(family, _)| family.eq_ignore_ascii_case(requested))
-            .map(|(family, _)| family.clone())
+            // Match fontdb's family-name query semantics exactly. Accepting a
+            // differently-cased spelling here would still leave it unresolved
+            // when usvg later queries the database.
+            .any(|(family, _)| family == requested)
     })
 }
 
 #[cfg(feature = "svg_text")]
-fn fallback_family_name(
-    database: &Database,
-    preferred_name_fragment: &str,
-    monospaced: bool,
-) -> Option<String> {
-    let matching_width: Vec<_> = database
-        .faces()
-        .filter(|face| face.monospaced == monospaced)
-        .collect();
-
-    matching_width
-        .iter()
-        .flat_map(|face| &face.families)
-        .find(|(family, _)| family.to_lowercase().contains(preferred_name_fragment))
-        .or_else(|| matching_width.iter().flat_map(|face| &face.families).next())
-        .map(|(family, _)| family.clone())
-}
-
-#[cfg(feature = "svg_text")]
-fn fontconfig_family(pattern: &str) -> Option<String> {
+fn fontconfig_sans_serif_family() -> Option<String> {
     #[cfg(all(
         unix,
         not(any(target_os = "macos", target_os = "ios", target_os = "android"))
@@ -135,8 +78,8 @@ fn fontconfig_family(pattern: &str) -> Option<String> {
         use std::process::{Command, Stdio};
 
         let output = Command::new("fc-match")
-            .arg("--format=%{family}\\n")
-            .arg(pattern)
+            .arg("--format=%{family[0]}\\n")
+            .arg("sans-serif")
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
@@ -146,19 +89,14 @@ fn fontconfig_family(pattern: &str) -> Option<String> {
         }
     }
 
-    let _ = pattern;
     None
 }
 
 #[cfg(feature = "svg_text")]
 fn parse_fontconfig_family(stdout: &[u8]) -> Option<String> {
-    String::from_utf8_lossy(stdout)
-        .lines()
-        .next()?
-        .split(',')
-        .map(str::trim)
-        .find(|family| !family.is_empty())
-        .map(str::to_owned)
+    let family = String::from_utf8_lossy(stdout);
+    let family = family.trim();
+    (!family.is_empty()).then(|| family.to_owned())
 }
 
 impl ImageLoader for MimeSvgLoader {
@@ -254,9 +192,9 @@ mod tests {
 
     #[cfg(feature = "svg_text")]
     #[test]
-    fn parses_first_concrete_fontconfig_family() {
+    fn parses_concrete_fontconfig_family() {
         assert_eq!(
-            parse_fontconfig_family(b"DejaVu Sans,DejaVu Sans Condensed\n"),
+            parse_fontconfig_family(b"DejaVu Sans\n"),
             Some("DejaVu Sans".to_string())
         );
         assert_eq!(parse_fontconfig_family(b"\n"), None);
