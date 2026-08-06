@@ -4,13 +4,18 @@
 //! loader currently accepts only URIs ending in `.svg`. Dynamic image URLs
 //! commonly omit that suffix while returning `image/svg+xml` correctly.
 
-use std::sync::Arc;
+use std::{collections::HashMap, mem::size_of, sync::Arc};
 
-use egui::load::{BytesPoll, ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint};
+use egui::{
+    load::{BytesPoll, ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint},
+    mutex::Mutex,
+    ColorImage,
+};
 #[cfg(feature = "svg_text")]
 use resvg::usvg::fontdb::{Database, Family};
 
 struct MimeSvgLoader {
+    cache: Mutex<HashMap<(String, SizeHint), Result<Arc<ColorImage>, String>>>,
     options: resvg::usvg::Options<'static>,
 }
 
@@ -28,7 +33,10 @@ impl Default for MimeSvgLoader {
             repair_generic_font_families(options.fontdb_mut());
             options
         };
-        Self { options }
+        Self {
+            cache: Mutex::default(),
+            options,
+        }
     }
 }
 
@@ -119,7 +127,10 @@ fn fallback_family_name(
 
 #[cfg(feature = "svg_text")]
 fn fontconfig_family(pattern: &str) -> Option<String> {
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
     {
         use std::process::{Command, Stdio};
 
@@ -162,11 +173,21 @@ impl ImageLoader for MimeSvgLoader {
             return Err(LoadError::NotSupported);
         }
 
+        let key = (uri.to_owned(), size_hint);
+        if let Some(result) = self.cache.lock().get(&key).cloned() {
+            return result
+                .map(|image| ImagePoll::Ready { image })
+                .map_err(LoadError::Loading);
+        }
+
         match ctx.try_load_bytes(uri)? {
             BytesPoll::Pending { size } => Ok(ImagePoll::Pending { size }),
             BytesPoll::Ready { bytes, mime, .. } if mime.as_deref().is_some_and(is_svg_mime) => {
-                egui_extras::image::load_svg_bytes_with_size(&bytes, size_hint, &self.options)
-                    .map(Arc::new)
+                let result =
+                    egui_extras::image::load_svg_bytes_with_size(&bytes, size_hint, &self.options)
+                        .map(Arc::new);
+                self.cache.lock().insert(key, result.clone());
+                result
                     .map(|image| ImagePoll::Ready { image })
                     .map_err(LoadError::Loading)
             }
@@ -174,13 +195,25 @@ impl ImageLoader for MimeSvgLoader {
         }
     }
 
-    fn forget(&self, _uri: &str) {}
+    fn forget(&self, uri: &str) {
+        self.cache
+            .lock()
+            .retain(|(cached_uri, _), _| cached_uri != uri);
+    }
 
-    fn forget_all(&self) {}
+    fn forget_all(&self) {
+        self.cache.lock().clear();
+    }
 
     fn byte_size(&self) -> usize {
-        // Decoded textures are cached by egui's DefaultTextureLoader.
-        0
+        self.cache
+            .lock()
+            .values()
+            .map(|result| match result {
+                Ok(image) => image.pixels.len() * size_of::<egui::Color32>(),
+                Err(error) => error.len(),
+            })
+            .sum()
     }
 }
 
@@ -200,9 +233,16 @@ pub(crate) fn install(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_svg_mime;
+    use std::sync::Arc;
+
+    use egui::{
+        load::{ImageLoader, SizeHint},
+        Color32, ColorImage,
+    };
+
     #[cfg(feature = "svg_text")]
     use super::parse_fontconfig_family;
+    use super::{is_svg_mime, MimeSvgLoader};
 
     #[test]
     fn recognizes_svg_mime_with_optional_parameters() {
@@ -221,5 +261,35 @@ mod tests {
         );
         assert_eq!(parse_fontconfig_family(b"\n"), None);
         assert_eq!(parse_fontconfig_family(b""), None);
+    }
+
+    #[test]
+    fn forget_removes_every_cached_size_for_uri() {
+        let loader = MimeSvgLoader {
+            cache: Default::default(),
+            options: resvg::usvg::Options::default(),
+        };
+        let image = Arc::new(ColorImage::filled([1, 1], Color32::WHITE));
+
+        loader.cache.lock().insert(
+            ("https://example.com/badge".to_owned(), SizeHint::Width(10)),
+            Ok(image.clone()),
+        );
+        loader.cache.lock().insert(
+            ("https://example.com/badge".to_owned(), SizeHint::Width(20)),
+            Ok(image.clone()),
+        );
+        loader.cache.lock().insert(
+            ("https://example.com/other".to_owned(), SizeHint::Width(10)),
+            Ok(image),
+        );
+
+        loader.forget("https://example.com/badge");
+
+        let cache = loader.cache.lock();
+        assert_eq!(cache.len(), 1);
+        assert!(cache
+            .keys()
+            .all(|(uri, _)| uri == "https://example.com/other"));
     }
 }
