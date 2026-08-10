@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -126,13 +126,105 @@ fn portal_introspection_has_file_chooser(stdout: &[u8]) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn folder_path_from_picker_output(stdout: Vec<u8>) -> Option<PathBuf> {
+fn path_from_picker_output(stdout: Vec<u8>) -> Option<PathBuf> {
     if stdout.is_empty() {
         None
     } else {
         // Python writes os.fsencode(path), so preserve arbitrary Unix path
         // bytes rather than requiring the selected directory to be UTF-8.
         Some(PathBuf::from(OsString::from_vec(stdout)))
+    }
+}
+
+/// Use Python's standard-library Tk binding as a no-install file picker on
+/// Linux desktops where xdg-desktop-portal is not installed.
+#[cfg(target_os = "linux")]
+fn pick_file_with_tkinter(initial_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    const SCRIPT: &str = r#"
+import os
+import sys
+import tkinter as tk
+from tkinter import filedialog
+
+root = tk.Tk()
+root.withdraw()
+try:
+    options = {
+        "title": "Open Markdown File",
+        "parent": root,
+        "filetypes": [
+            ("Markdown", ("*.md", "*.markdown")),
+            ("Text", "*.txt"),
+            ("All Files", "*"),
+        ],
+    }
+    if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
+        options["initialdir"] = sys.argv[1]
+    selected = filedialog.askopenfilename(**options)
+    if selected:
+        sys.stdout.buffer.write(os.fsencode(selected))
+finally:
+    root.destroy()
+"#;
+
+    let mut command = Command::new("python3");
+    command
+        .arg("-c")
+        .arg(SCRIPT)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped());
+    if let Some(directory) = initial_dir.filter(|path| path.is_dir()) {
+        command.arg(directory);
+    }
+
+    let output = command
+        .output()
+        .map_err(|error| format!("Tkinter file picker could not start: {error}"))?;
+
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if details.is_empty() {
+            "Tkinter file picker exited with an error".to_string()
+        } else {
+            format!("Tkinter file picker failed: {details}")
+        });
+    }
+
+    let selected = path_from_picker_output(output.stdout);
+    if let Some(path) = &selected {
+        if !path.is_file() {
+            return Err(format!(
+                "File picker returned a file that does not exist: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(selected)
+}
+
+fn pick_file(initial_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let mut dialog = rfd::FileDialog::new()
+        .add_filter("Markdown", &["md", "markdown"])
+        .add_filter("Text", &["txt"])
+        .add_filter("All Files", &["*"]);
+    if let Some(directory) = initial_dir.filter(|path| path.is_dir()) {
+        dialog = dialog.set_directory(directory);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if portal_file_chooser_available() {
+            return Ok(dialog.pick_file());
+        }
+
+        log::info!("XDG Desktop Portal FileChooser is unavailable; using the Tkinter file picker");
+        pick_file_with_tkinter(initial_dir)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(dialog.pick_file())
     }
 }
 
@@ -184,7 +276,7 @@ finally:
         });
     }
 
-    let selected = folder_path_from_picker_output(output.stdout);
+    let selected = path_from_picker_output(output.stdout);
     if let Some(path) = &selected {
         if !path.is_dir() {
             return Err(format!(
@@ -1706,13 +1798,20 @@ impl MarkdownApp {
     }
 
     fn open_file_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Markdown", &["md", "markdown"])
-            .add_filter("Text", &["txt"])
-            .add_filter("All Files", &["*"])
-            .pick_file()
-        {
-            self.open_in_new_tab(path);
+        let initial_dir = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.path.parent())
+            .map(Path::to_path_buf)
+            .or_else(|| self.file_explorer.root.clone());
+
+        match pick_file(initial_dir.as_deref()) {
+            Ok(Some(path)) => self.open_in_new_tab(path),
+            Ok(None) => {}
+            Err(error) => {
+                log::error!("Unable to open file picker: {error}");
+                self.error_message = Some(format!("Unable to open file picker: {error}"));
+            }
         }
     }
 
@@ -4681,7 +4780,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn empty_folder_picker_output_means_cancelled() {
-        assert_eq!(folder_path_from_picker_output(Vec::new()), None);
+        assert_eq!(path_from_picker_output(Vec::new()), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -4689,7 +4788,7 @@ mod tests {
     fn folder_picker_output_preserves_path_bytes() {
         let bytes = b"/tmp/example folder".to_vec();
         assert_eq!(
-            folder_path_from_picker_output(bytes),
+            path_from_picker_output(bytes),
             Some(PathBuf::from("/tmp/example folder"))
         );
     }
