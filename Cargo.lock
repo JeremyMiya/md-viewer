@@ -3373,11 +3373,13 @@ dependencies = [
  "mimalloc",
  "notify",
  "notify-debouncer-mini",
+ "pulldown-cmark 0.13.0",
  "regex",
  "rfd",
  "serde",
  "sys-locale",
  "ttf-parser",
+ "url",
 ]
 
 [[package]]

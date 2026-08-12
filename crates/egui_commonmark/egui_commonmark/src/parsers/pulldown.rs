@@ -571,6 +571,57 @@ fn is_likely_currency(tex: &str) -> bool {
     true
 }
 
+/// Find source-visible references that the host registered as local links.
+/// The host can therefore restrict auto-linking to paths that actually exist.
+fn registered_auto_link_ranges(
+    text: &str,
+    hooks: &std::collections::HashMap<String, bool>,
+) -> Vec<(Range<usize>, String)> {
+    let is_path_char = |ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/');
+    let mut matches = Vec::new();
+
+    for destination in hooks.keys() {
+        if destination.is_empty() || destination.starts_with('#') {
+            continue;
+        }
+        for (start, _) in text.match_indices(destination) {
+            let end = start + destination.len();
+            let left_ok = text[..start].chars().next_back().is_none_or(|ch| !is_path_char(ch));
+            let right_ok = text[end..].chars().next().is_none_or(|ch| !is_path_char(ch));
+            if left_ok && right_ok {
+                matches.push((start..end, destination.clone()));
+            }
+        }
+    }
+
+    // Prefer a longer registered path when two candidates start at the same
+    // byte, then discard any remaining overlap.
+    matches.sort_by(|(left_range, _), (right_range, _)| {
+        left_range
+            .start
+            .cmp(&right_range.start)
+            .then_with(|| right_range.len().cmp(&left_range.len()))
+    });
+    let mut last_end = 0;
+    matches.retain(|(range, _)| {
+        if range.start < last_end {
+            false
+        } else {
+            last_end = range.end;
+            true
+        }
+    });
+    matches
+}
+
+fn registered_exact_auto_link(
+    text: &str,
+    hooks: &std::collections::HashMap<String, bool>,
+) -> Option<String> {
+    (!text.is_empty() && !text.starts_with('#') && hooks.contains_key(text))
+        .then(|| text.to_owned())
+}
+
 impl CommonMarkViewerInternal {
     /// Compute a hash of the text content for event cache lookup.
     fn hash_content(text: &str) -> u64 {
@@ -1352,6 +1403,14 @@ impl CommonMarkViewerInternal {
                 self.event_text_with_highlights(text, &src_span, cache, ui, options);
             }
             pulldown_cmark::Event::Code(text) => {
+                // A bare local Markdown filename is often written as inline code.
+                // Preserve the code styling, but give an exact registered path the
+                // same click behavior as its plain-text counterpart.
+                let auto_link = self
+                    .link
+                    .is_none()
+                    .then(|| registered_exact_auto_link(&text, cache.link_hooks()))
+                    .flatten();
                 self.text_style.code = true;
                 let segments = inline_code_wrap_segments(&text);
                 let wrap = segments.len() > 1;
@@ -1370,6 +1429,12 @@ impl CommonMarkViewerInternal {
                     None
                 };
                 for segment in segments {
+                    if let Some(destination) = auto_link.as_ref() {
+                        self.link = Some(crate::Link {
+                            destination: destination.clone(),
+                            text: Vec::new(),
+                        });
+                    }
                     if let Some(ref span) = interior_span {
                         // Inline code stays source-literal while retaining byte-range highlights.
                         self.event_literal_text_with_highlights(
@@ -1381,6 +1446,11 @@ impl CommonMarkViewerInternal {
                         );
                     } else {
                         self.event_text(segment.into(), ui, options);
+                    }
+                    if auto_link.is_some() {
+                        if let Some(link) = self.link.take() {
+                            link.end(ui, cache);
+                        }
                     }
                     if wrap {
                         ui.end_row();
@@ -1549,6 +1619,71 @@ impl CommonMarkViewerInternal {
 
     /// Expand eligible emoji shortcodes, then preserve source-based search semantics.
     fn event_text_with_highlights(
+        &mut self,
+        text: CowStr,
+        span: &Range<usize>,
+        cache: &mut CommonMarkCache,
+        ui: &mut Ui,
+        options: &CommonMarkOptions,
+    ) {
+        // Existing Markdown links already own their text, while headings and
+        // image alt text have specialized accumulation semantics. Auto-link
+        // only ordinary visible prose whose bytes map exactly to source.
+        if self.link.is_none()
+            && self.image.is_none()
+            && self.code_block.is_none()
+            && self.text_style.heading.is_none()
+            && text.len() == span.len()
+        {
+            let links = registered_auto_link_ranges(&text, cache.link_hooks());
+            if !links.is_empty() {
+                let mut cursor = 0;
+                for (range, destination) in links {
+                    if cursor < range.start {
+                        self.event_text_segment_with_highlights(
+                            (&text[cursor..range.start]).into(),
+                            &(span.start + cursor..span.start + range.start),
+                            cache,
+                            ui,
+                            options,
+                        );
+                    }
+
+                    self.link = Some(crate::Link {
+                        destination,
+                        text: Vec::new(),
+                    });
+                    self.event_text_segment_with_highlights(
+                        (&text[range.clone()]).into(),
+                        &(span.start + range.start..span.start + range.end),
+                        cache,
+                        ui,
+                        options,
+                    );
+                    if let Some(link) = self.link.take() {
+                        link.end(ui, cache);
+                    }
+                    cursor = range.end;
+                }
+                if cursor < text.len() {
+                    self.event_text_segment_with_highlights(
+                        (&text[cursor..]).into(),
+                        &(span.start + cursor..span.end),
+                        cache,
+                        ui,
+                        options,
+                    );
+                }
+                return;
+            }
+        }
+
+        self.event_text_segment_with_highlights(text, span, cache, ui, options);
+    }
+
+    /// Expand emoji shortcodes and apply source-based highlights to one plain
+    /// or auto-linked visible text segment.
+    fn event_text_segment_with_highlights(
         &mut self,
         text: CowStr,
         span: &Range<usize>,
@@ -2157,6 +2292,42 @@ mod tests {
             }
         }
         visible
+    }
+
+    #[test]
+    fn registered_markdown_paths_are_detected_as_auto_links() {
+        let hooks = std::collections::HashMap::from([
+            ("docs/guide.md".to_string(), false),
+            ("#section".to_string(), false),
+        ]);
+        assert_eq!(
+            registered_auto_link_ranges("See docs/guide.md, then continue.", &hooks),
+            vec![(4..17, "docs/guide.md".to_string())]
+        );
+    }
+
+    #[test]
+    fn auto_link_detection_respects_filename_boundaries() {
+        let hooks = std::collections::HashMap::from([("guide.md".to_string(), false)]);
+        assert!(registered_auto_link_ranges("not-guide.md.backup", &hooks).is_empty());
+        assert_eq!(
+            registered_auto_link_ranges("(guide.md)", &hooks),
+            vec![(1..9, "guide.md".to_string())]
+        );
+    }
+
+    #[test]
+    fn inline_code_can_match_an_exact_registered_markdown_path() {
+        let hooks = std::collections::HashMap::from([
+            ("docs/guide.md".to_string(), false),
+            ("#section".to_string(), false),
+        ]);
+        assert_eq!(
+            registered_exact_auto_link("docs/guide.md", &hooks),
+            Some("docs/guide.md".to_string())
+        );
+        assert_eq!(registered_exact_auto_link("#section", &hooks), None);
+        assert_eq!(registered_exact_auto_link("guide.md", &hooks), None);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use egui_commonmark_extended::{CommonMarkCache, CommonMarkViewer};
 struct PaintedText {
     text: String,
     rect: Rect,
+    underlined: bool,
 }
 
 fn collect_painted_text(shape: &Shape, painted: &mut Vec<PaintedText>) {
@@ -18,6 +19,12 @@ fn collect_painted_text(shape: &Shape, painted: &mut Vec<PaintedText>) {
         Shape::Text(text) => painted.push(PaintedText {
             text: text.galley.job.text.clone(),
             rect: text.galley.rect.translate(text.pos.to_vec2()),
+            underlined: text
+                .galley
+                .job
+                .sections
+                .iter()
+                .any(|section| section.format.underline.width > 0.0),
         }),
         Shape::Vec(shapes) => {
             for shape in shapes {
@@ -29,8 +36,19 @@ fn collect_painted_text(shape: &Shape, painted: &mut Vec<PaintedText>) {
 }
 
 fn render_geometry(markdown: &str, width: f32) -> (Rect, f32, Vec<PaintedText>) {
+    render_geometry_with_hooks(markdown, width, &[])
+}
+
+fn render_geometry_with_hooks(
+    markdown: &str,
+    width: f32,
+    hooks: &[&str],
+) -> (Rect, f32, Vec<PaintedText>) {
     let ctx = Context::default();
     let mut cache = CommonMarkCache::default();
+    for hook in hooks {
+        cache.add_link_hook(*hook);
+    }
     let mut body_rect = Rect::NOTHING;
     let mut painted = Vec::new();
 
@@ -111,6 +129,20 @@ fn unbreakable_long_inline_code_wraps() {
         rect.height() > row_height * 1.5,
         "unbroken long inline code did not wrap: rect={rect:?} row_height={row_height}"
     );
+}
+
+#[test]
+fn long_inline_code_path_keeps_clickable_link_styling_after_wrapping() {
+    let path = "github/research/github50/docs/AMIHUD_HT8D_BASELINE_ERROR_RETROSPECTIVE.md";
+    let markdown = format!("Trigger: `{path}`");
+    let (_, _, painted) = render_geometry_with_hooks(&markdown, 540.0, &[path]);
+    let linked_text: String = painted
+        .iter()
+        .filter(|entry| entry.underlined)
+        .map(|entry| entry.text.as_str())
+        .collect();
+
+    assert_eq!(linked_text, path, "painted text: {painted:#?}");
 }
 
 // ---------------------------------------------------------------------------

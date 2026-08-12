@@ -35,9 +35,6 @@ const RECENT_SHOWN: usize = 6;
 /// Compiled regex for parsing markdown headers (lazy, compiled once)
 static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})\s+(.+)$").unwrap());
 
-/// Compiled regex for parsing markdown links (lazy, compiled once)
-static LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]*)\]\(([^)]+)\)").unwrap());
-
 const MAX_WATCHER_RETRIES: u32 = 3;
 const FLASH_DURATION_MS: u64 = 600;
 
@@ -233,7 +230,8 @@ struct SearchState {
 /// Action from file explorer interaction
 #[derive(Default)]
 struct ExplorerAction {
-    /// File to open in a new tab (left-click)
+    /// File selected with the primary mouse button. The caller decides whether
+    /// it replaces the active document or opens a tab from the Ctrl modifier.
     file_to_open: Option<PathBuf>,
     /// File to close (middle-click on open file)
     file_to_close: Option<PathBuf>,
@@ -671,7 +669,7 @@ impl Tab {
         let path = path.canonicalize().unwrap_or(path);
         let content = fs::read_to_string(&path).unwrap_or_default();
         let parsed = parse_headers(&content);
-        let local_links = parse_local_links(&content);
+        let local_links = parse_local_links(&content, &path);
         let content_lines = content.lines().count();
         let base_uri = Self::compute_base_uri(&path);
 
@@ -729,7 +727,7 @@ impl Tab {
             self.outline_headers = parsed.outline_headers;
             self.collapsed_headers.clear();
 
-            self.local_links = parse_local_links(&self.content);
+            self.local_links = parse_local_links(&self.content, &self.path);
             for link in &self.local_links {
                 self.cache.add_link_hook(link);
             }
@@ -766,7 +764,7 @@ impl Tab {
             self.outline_headers = parsed.outline_headers;
             self.collapsed_headers.clear();
 
-            self.local_links = parse_local_links(&self.content);
+            self.local_links = parse_local_links(&self.content, &self.path);
             for link in &self.local_links {
                 self.cache.add_link_hook(link);
             }
@@ -785,17 +783,26 @@ impl Tab {
             return;
         };
 
-        let path_part = link.split('#').next().unwrap_or(link);
-        let target_path = current_dir.join(path_part);
-
-        let target_path = match target_path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => return,
+        let Some(target_path) = resolve_local_link_path(link, current_dir) else {
+            return;
         };
+
+        self.navigate_to_path(&target_path);
+    }
+
+    /// Replace this tab's document and record a browser-like history entry.
+    fn navigate_to_path(&mut self, target_path: &Path) -> bool {
+        let Ok(target_path) = target_path.canonicalize() else {
+            return false;
+        };
+        if target_path == self.path || !target_path.is_file() {
+            return false;
+        }
 
         self.history_back.push(self.path.clone());
         self.history_forward.clear();
         self.load_file(&target_path);
+        true
     }
 
     fn check_link_hooks(&self) -> Option<String> {
@@ -835,37 +842,101 @@ impl Tab {
         }
 
         let current_dir = self.path.parent()?;
-        let path_part = link.split('#').next().unwrap_or(link);
-        let target_path = current_dir.join(path_part);
+        let target_path = resolve_local_link_path(link, current_dir)?;
         target_path.canonicalize().ok()
     }
 }
 
-/// Parse local markdown file links and anchor links from content, skipping code blocks.
-fn parse_local_links(content: &str) -> Vec<String> {
-    let link_re = &*LINK_RE;
-    let mut links = Vec::new();
+/// Parse explicit links plus bare local Markdown file references, skipping code blocks.
+fn parse_local_links(content: &str, document_path: &Path) -> Vec<String> {
+    let mut links = HashSet::new();
+    let document_dir = document_path.parent().unwrap_or_else(|| Path::new("."));
     let mut in_code_block = false;
 
-    for line in content.lines() {
-        if line.trim_start().starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
-        }
-
-        if in_code_block {
-            continue;
-        }
-
-        for cap in link_re.captures_iter(line) {
-            let destination = &cap[2];
-            if is_local_markdown_link(destination) || destination.starts_with('#') {
-                links.push(destination.to_string());
+    // Let CommonMark decide which bytes are visible text. Event::Text excludes
+    // fenced/indented code and link destinations, while Event::Code preserves
+    // the viewer extension that makes an inline-code filename clickable.
+    for event in pulldown_cmark::Parser::new_ext(content, pulldown_cmark::Options::all()) {
+        match event {
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_)) => {
+                in_code_block = true;
             }
+            pulldown_cmark::Event::End(pulldown_cmark::TagEnd::CodeBlock) => {
+                in_code_block = false;
+            }
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { dest_url, .. }) => {
+                let destination = dest_url.as_ref();
+                if is_local_markdown_link(destination) || destination.starts_with('#') {
+                    links.insert(destination.to_owned());
+                }
+            }
+            pulldown_cmark::Event::Code(code) => {
+                register_existing_markdown_path(&code, document_dir, &mut links);
+            }
+            pulldown_cmark::Event::Text(text) if !in_code_block => {
+                register_bare_markdown_paths(&text, document_dir, &mut links);
+            }
+            _ => {}
         }
     }
 
+    let mut links: Vec<_> = links.into_iter().collect();
+    links.sort();
     links
+}
+
+fn register_bare_markdown_paths(text: &str, document_dir: &Path, links: &mut HashSet<String>) {
+    for token in text.split_whitespace() {
+        let destination = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '*'
+                    | '_'
+                    | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | '.'
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | '，'
+                    | '。'
+                    | '；'
+                    | '：'
+                    | '！'
+                    | '？'
+                    | '（'
+                    | '）'
+                    | '【'
+                    | '】'
+                    | '《'
+                    | '》'
+            )
+        });
+        register_existing_markdown_path(destination, document_dir, links);
+    }
+}
+
+fn register_existing_markdown_path(
+    destination: &str,
+    document_dir: &Path,
+    links: &mut HashSet<String>,
+) {
+    if !is_local_markdown_link(destination) {
+        return;
+    }
+    if resolve_local_link_path(destination, document_dir).is_some_and(|path| path.is_file()) {
+        links.insert(destination.to_owned());
+    }
 }
 
 /// Check if a link destination points to a local markdown file
@@ -880,14 +951,38 @@ fn is_local_markdown_link(destination: &str) -> bool {
         return false;
     }
 
-    let path_part = destination.split('#').next().unwrap_or(destination);
-    let path = std::path::Path::new(path_part);
+    let path = if destination.starts_with("file://") {
+        let Ok(url) = url::Url::parse(destination) else {
+            return false;
+        };
+        let Ok(path) = url.to_file_path() else {
+            return false;
+        };
+        path
+    } else {
+        PathBuf::from(destination.split('#').next().unwrap_or(destination))
+    };
     path.extension()
         .map(|ext| {
             let ext = ext.to_string_lossy().to_lowercase();
             ext == "md" || ext == "markdown" || ext == "txt"
         })
         .unwrap_or(false)
+}
+
+/// Resolve a relative/absolute filesystem path or a `file://` URI against the
+/// directory containing the Markdown document.
+fn resolve_local_link_path(destination: &str, document_dir: &Path) -> Option<PathBuf> {
+    if destination.starts_with("file://") {
+        return url::Url::parse(destination).ok()?.to_file_path().ok();
+    }
+
+    let path = Path::new(destination.split('#').next().unwrap_or(destination));
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        document_dir.join(path)
+    })
 }
 
 /// Truncate a string for display, adding "..." if it exceeds max_len.
@@ -1624,6 +1719,53 @@ impl MarkdownApp {
         self.refresh_open_tab_paths();
 
         // Update watcher if enabled
+        if self.watch_enabled {
+            self.update_watched_paths();
+        }
+    }
+
+    fn navigate_active_tab_to(&mut self, path: &Path) {
+        if self.tabs.is_empty() {
+            self.open_in_new_tab(path.to_path_buf());
+            return;
+        }
+
+        let changed = self
+            .tabs
+            .get_mut(self.active_tab)
+            .is_some_and(|tab| tab.navigate_to_path(path));
+        if !changed {
+            return;
+        }
+
+        let opened_path = self.tabs[self.active_tab].path.clone();
+        self.record_recent(&opened_path);
+        self.title_dirty = true;
+        self.refresh_open_tab_paths();
+        if self.watch_enabled {
+            self.update_watched_paths();
+        }
+    }
+
+    fn navigate_active_history(&mut self, go_back: bool) {
+        let previous_path = self.tabs.get(self.active_tab).map(|tab| tab.path.clone());
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            if go_back {
+                tab.navigate_back();
+            } else {
+                tab.navigate_forward();
+            }
+        }
+        let current_path = self.tabs.get(self.active_tab).map(|tab| tab.path.clone());
+        if current_path == previous_path {
+            return;
+        }
+
+        if let Some(path) = current_path {
+            self.record_recent(&path);
+        }
+        self.title_dirty = true;
+        self.refresh_open_tab_paths();
         if self.watch_enabled {
             self.update_watched_paths();
         }
@@ -3890,17 +4032,6 @@ impl eframe::App for MarkdownApp {
         if let Some(idx) = focus_tab {
             self.focus_tab(idx);
         }
-        if go_back {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.navigate_back();
-            }
-        }
-        if go_forward {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.navigate_forward();
-            }
-        }
-
         // Search bar actions (Ctrl+F open, Enter/Shift+Enter cycle, Esc close)
         if open_search {
             self.search.is_open = true;
@@ -4245,14 +4376,10 @@ impl eframe::App for MarkdownApp {
 
         // Handle navigation button clicks (must be after menu bar UI)
         if go_back {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.navigate_back();
-            }
+            self.navigate_active_history(true);
         }
         if go_forward {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.navigate_forward();
-            }
+            self.navigate_active_history(false);
         }
 
         // Show error message if any
@@ -4304,9 +4431,14 @@ impl eframe::App for MarkdownApp {
         // File explorer (left sidebar)
         let explorer_action = self.render_file_explorer(ctx);
 
-        // Open file from explorer (left-click)
+        // Explorer matches document links: primary click replaces the active
+        // document, while Ctrl/Cmd+click opens (or focuses) a separate tab.
         if let Some(path) = explorer_action.file_to_open {
-            self.open_in_new_tab(path);
+            if ctrl_held {
+                self.open_in_new_tab(path);
+            } else {
+                self.navigate_active_tab_to(&path);
+            }
         }
 
         // Close tab from explorer (middle-click on open file)
@@ -4321,11 +4453,26 @@ impl eframe::App for MarkdownApp {
 
         // Main content area
         let mut open_in_new_tab: Option<PathBuf> = None;
+        let path_before_render = self.tabs.get(self.active_tab).map(|tab| tab.path.clone());
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::ZERO))
             .show(ctx, |ui| {
                 open_in_new_tab = self.render_tab_content(ui, ctrl_held);
             });
+
+        // A primary-clicked document link navigates inside Tab while it is
+        // rendered. Synchronize the app-level state that depends on tab paths.
+        let path_after_render = self.tabs.get(self.active_tab).map(|tab| tab.path.clone());
+        if path_after_render != path_before_render {
+            if let Some(path) = path_after_render {
+                self.record_recent(&path);
+            }
+            self.title_dirty = true;
+            self.refresh_open_tab_paths();
+            if self.watch_enabled {
+                self.update_watched_paths();
+            }
+        }
 
         // Open link in new tab if requested
         if let Some(path) = open_in_new_tab {
@@ -4707,6 +4854,126 @@ mod tests {
             parsed.outline_headers[1].normalized_title,
             "pin :not_a_gemoji:"
         );
+    }
+
+    #[test]
+    fn bare_existing_markdown_path_is_registered_as_local_link() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-auto-link-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        fs::create_dir_all(root.join("docs")).unwrap();
+        let document = root.join("index.md");
+        fs::write(&document, "See docs/guide.md for details.").unwrap();
+        fs::write(root.join("docs/guide.md"), "# Guide").unwrap();
+
+        let links = parse_local_links("See docs/guide.md for details.", &document);
+        assert_eq!(links, vec!["docs/guide.md"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inline_code_markdown_path_can_touch_chinese_prose_and_punctuation() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-inline-link-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        fs::create_dir_all(root.join("github/research/docs")).unwrap();
+        let document = root.join("index.md");
+        fs::write(&document, "# Index").unwrap();
+        fs::write(root.join("github/research/docs/audit.md"), "# Audit").unwrap();
+
+        let content = "触发文档：`github/research/docs/audit.md`：详细说明";
+        assert_eq!(
+            parse_local_links(content, &document),
+            vec!["github/research/docs/audit.md"]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nonexistent_bare_markdown_path_is_not_registered() {
+        let document = std::env::temp_dir().join("md-viewer-auto-link-missing/index.md");
+        assert!(parse_local_links("See missing.md for details.", &document).is_empty());
+    }
+
+    #[test]
+    fn fenced_and_indented_code_never_register_bare_markdown_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-fenced-link-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let document = root.join("index.md");
+        fs::write(&document, "# Index").unwrap();
+        fs::write(root.join("guide.md"), "# Guide").unwrap();
+
+        let code_blocks = concat!(
+            "~~~text\nguide.md\n~~~\n\n",
+            "````text\nguide.md\n````\n\n",
+            "    guide.md\n",
+        );
+        assert!(parse_local_links(code_blocks, &document).is_empty());
+        assert_eq!(parse_local_links("`guide.md`", &document), ["guide.md"]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn absolute_path_and_file_uri_are_registered_as_local_links() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-auto-link-uri-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        fs::create_dir_all(root.join("docs with spaces")).unwrap();
+        let document = root.join("index.md");
+        let absolute_target = root.join("guide.md");
+        let uri_target = root.join("docs with spaces/guide.md");
+        fs::write(&document, "# Index").unwrap();
+        fs::write(&absolute_target, "# Absolute guide").unwrap();
+        fs::write(&uri_target, "# URI guide").unwrap();
+
+        let absolute = absolute_target.to_string_lossy();
+        let file_uri = url::Url::from_file_path(&uri_target).unwrap().to_string();
+        let content = format!("`{absolute}` and `{file_uri}`");
+        let links = parse_local_links(&content, &document);
+
+        assert_eq!(links, vec![absolute.to_string(), file_uri]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tab_path_navigation_tracks_back_and_forward_history() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-navigation-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.md");
+        let second = root.join("second.md");
+        fs::write(&first, "# First").unwrap();
+        fs::write(&second, "# Second").unwrap();
+
+        let mut tab = Tab::new(first.canonicalize().unwrap());
+        assert!(tab.navigate_to_path(&second));
+        assert_eq!(tab.path, second.canonicalize().unwrap());
+        assert!(tab.can_go_back());
+        assert!(!tab.can_go_forward());
+
+        tab.navigate_back();
+        assert_eq!(tab.path, first.canonicalize().unwrap());
+        assert!(tab.can_go_forward());
+
+        tab.navigate_forward();
+        assert_eq!(tab.path, second.canonicalize().unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
