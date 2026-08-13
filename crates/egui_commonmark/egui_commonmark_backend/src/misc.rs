@@ -390,6 +390,34 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "math")]
+    #[test]
+    fn cjk_text_in_math_uses_real_glyphs_when_system_fallback_exists() {
+        if !MATH_FONTS
+            .iter()
+            .any(|font| font.ttf().glyph_index('在').is_some())
+        {
+            return;
+        }
+
+        let render = |latex| {
+            render_math_formula(
+                latex,
+                true,
+                egui::Color32::BLACK,
+                egui::Color32::WHITE,
+            )
+            .unwrap()
+            .image
+        };
+        let first = render(r"\text{在}");
+        let second = render(r"\text{中}");
+
+        assert_ne!(
+            first.pixels, second.pixels,
+            "different CJK characters must not render as the same missing-glyph box"
+        );
+    }
     #[test]
     fn strong_code_keeps_monospace_font_family() {
         // Even with md-viewer's strong-font opt-in, strong inline code should
@@ -1222,12 +1250,38 @@ static MATH_FONTS: LazyLock<Vec<typst::text::Font>> = LazyLock::new(|| {
     searcher
         .include_system_fonts(false)
         .include_embedded_fonts(true);
-    searcher
+    let mut fonts: Vec<_> = searcher
         .search()
         .fonts
         .iter()
         .filter_map(|slot| slot.get())
-        .collect()
+        .collect();
+
+    // `\text{...}` inside formulas can contain CJK prose. Typst's embedded
+    // math fonts cover Latin and mathematical glyphs but not CJK, which would
+    // otherwise render as identical tofu boxes. Ask fontconfig for one generic
+    // Chinese sans-serif fallback and load only that file. This keeps startup
+    // fast and portable across Linux distributions without hard-coding a Noto,
+    // Source Han, WenQuanYi, or distro-specific font path/name.
+    let fallback_path = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}\n", "sans-serif:lang=zh-cn"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+        });
+    if let Some(path) = fallback_path {
+        if let Ok(data) = std::fs::read(path) {
+            fonts.extend(typst::text::Font::iter(typst::foundations::Bytes::new(data)));
+        }
+    }
+
+    fonts
 });
 
 /// Number of formulas to render (and fonts to load) concurrently. typst
