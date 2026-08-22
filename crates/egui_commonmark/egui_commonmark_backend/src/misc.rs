@@ -360,6 +360,28 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "math")]
+    #[test]
+    fn renders_amsmath_named_operators() {
+        let formulas = [
+            r#"r_{\text{dir}}=r_{61.2s}\operatorname{sign}(\text{event value})."#,
+            r#"\operatorname*{arg\,max}_{x} f(x)"#,
+        ];
+
+        for latex in formulas {
+            let rendered = render_math_formula(
+                latex,
+                false,
+                egui::Color32::BLACK,
+                egui::Color32::WHITE,
+            )
+            .unwrap_or_else(|error| panic!("failed to render {latex:?}: {error}"));
+
+            assert!(rendered.size.x > 0.0);
+            assert!(rendered.size.y > 0.0);
+        }
+    }
+
     #[test]
     fn strong_code_keeps_monospace_font_family() {
         // Even with md-viewer's strong-font opt-in, strong inline code should
@@ -1159,6 +1181,9 @@ const MITEX_PREAMBLE: &str = r#"
 #let textbf(it) = text(weight: "bold", it)
 #let textit(it) = text(style: "italic", it)
 #let textrm(it) = text(it)
+// amsmath named operators emitted by mitex's standard command specification.
+#let operatorname(it) = math.op(math.upright(it))
+#let operatornamewithlimits(it) = math.op(limits: true, math.upright(it))
 // amsmath fraction/box/spacing commands mitex emits but does not map to typst:
 //   \tfrac/\dfrac -> tfrac(..)/dfrac(..), \boxed -> boxed(..), \! -> negthinspace
 #let tfrac(num, denom) = math.inline(math.frac(num, denom))
