@@ -40,6 +40,12 @@ pub struct CommonMarkOptions<'f> {
     pub max_image_width: Option<usize>,
     pub show_alt_text_on_hover: bool,
     pub default_width: Option<usize>,
+    /// Width bound for tables, independent of `default_width`. Tables may
+    /// exceed the reading column: when set, markdown and HTML tables scroll
+    /// horizontally within this width instead of the `default_width` cap, so
+    /// wide tables use the full content pane while prose stays at the reading
+    /// width (#64). `None` falls back to `max_width`.
+    pub table_max_width: Option<usize>,
     #[cfg(feature = "better_syntax_highlighting")]
     pub theme_light: String,
     #[cfg(feature = "better_syntax_highlighting")]
@@ -65,7 +71,8 @@ impl std::fmt::Debug for CommonMarkOptions<'_> {
         s.field("indentation_spaces", &self.indentation_spaces)
             .field("max_image_width", &self.max_image_width)
             .field("show_alt_text_on_hover", &self.show_alt_text_on_hover)
-            .field("default_width", &self.default_width);
+            .field("default_width", &self.default_width)
+            .field("table_max_width", &self.table_max_width);
 
         #[cfg(feature = "better_syntax_highlighting")]
         s.field("theme_light", &self.theme_light)
@@ -91,6 +98,7 @@ impl Default for CommonMarkOptions<'_> {
             max_image_width: None,
             show_alt_text_on_hover: true,
             default_width: None,
+            table_max_width: None,
             #[cfg(feature = "better_syntax_highlighting")]
             theme_light: DEFAULT_THEME_LIGHT.to_owned(),
             #[cfg(feature = "better_syntax_highlighting")]

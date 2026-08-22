@@ -1218,87 +1218,118 @@ impl CommonMarkViewerInternal {
             // relative to the parent's cursor, but the parent here is a horizontal-
             // flow Ui from the markdown renderer. Without the vertical scope the
             // body's first row overlaps the header row.
-            let mut scroll_out = egui::ScrollArea::horizontal()
-                .id_salt(id.with("_scroll"))
-                .max_width(max_width)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.vertical(|ui| {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            let table = egui_extras::TableBuilder::new(ui)
-                                .id_salt(id)
-                                .striped(true)
-                                .resizable(true)
-                                .vscroll(false)
-                                // Shrink horizontally to the columns' content so a
-                                // table narrower than the panel hugs its columns
-                                // instead of stretching the bordered frame full width
-                                // with an empty gap after the last column (#47). The
-                                // outer ScrollArea still bounds wide tables at
-                                // max_width and provides horizontal scroll.
-                                .auto_shrink([true, true])
-                                .min_scrolled_height(0.0)
-                                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                                .columns(
-                                    egui_extras::Column::auto().resizable(true).at_least(40.0),
-                                    num_cols,
-                                )
-                                .header(header_h, |mut row| {
-                                    for col in header {
-                                        row.col(|ui| {
-                                            let col_w = ui.available_width();
-                                            for (e, src_span) in col {
-                                                let tmp_start = std::mem::replace(
-                                                    &mut self.line.should_start_newline,
-                                                    false,
-                                                );
-                                                let tmp_end = std::mem::replace(
-                                                    &mut self.line.should_end_newline,
-                                                    false,
-                                                );
-                                                self.event(
-                                                    ui, e, src_span, cache, options, col_w,
-                                                );
-                                                self.line.should_start_newline = tmp_start;
-                                                self.line.should_end_newline = tmp_end;
+            //
+            // The bound is `table_max_width` rather than the prose `max_width` so a
+            // wide table spreads over the whole content pane even in reading mode,
+            // instead of being clipped at the reading column with its right side
+            // unreachable (#64).
+            let table_bound = options
+                .table_max_width
+                .map(|w| w as f32)
+                .unwrap_or(max_width);
+            // The document ui is allocated at the prose width, and a child ui
+            // can never exceed its parent's allocation — so a wider viewport
+            // must be carved out explicitly. egui does not clamp an explicit
+            // child max_rect to the parent, which lets the table scope span
+            // the full pane while prose keeps the reading width. Anchor at
+            // the current cursor, not max_rect, or the table would repaint on
+            // top of everything above it.
+            let mut table_scope_rect = ui.cursor();
+            table_scope_rect.max.x = table_scope_rect.min.x + table_bound;
+            table_scope_rect.max.y = ui.max_rect().bottom();
+            let scroll_out = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(table_scope_rect), |ui| {
+                    let mut scroll_out = egui::ScrollArea::horizontal()
+                        .id_salt(id.with("_scroll"))
+                        .max_width(table_bound)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.vertical(|ui| {
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    let table = egui_extras::TableBuilder::new(ui)
+                                        .id_salt(id)
+                                        .striped(true)
+                                        .resizable(true)
+                                        .vscroll(false)
+                                        // Shrink horizontally to the columns' content so a
+                                        // table narrower than the panel hugs its columns
+                                        // instead of stretching the bordered frame full width
+                                        // with an empty gap after the last column (#47). The
+                                        // outer ScrollArea still bounds wide tables at
+                                        // max_width and provides horizontal scroll.
+                                        .auto_shrink([true, true])
+                                        .min_scrolled_height(0.0)
+                                        .cell_layout(egui::Layout::left_to_right(
+                                            egui::Align::Center,
+                                        ))
+                                        .columns(
+                                            egui_extras::Column::auto()
+                                                .resizable(true)
+                                                .at_least(40.0),
+                                            num_cols,
+                                        )
+                                        .header(header_h, |mut row| {
+                                            for col in header {
+                                                row.col(|ui| {
+                                                    let col_w = ui.available_width();
+                                                    for (e, src_span) in col {
+                                                        let tmp_start = std::mem::replace(
+                                                            &mut self.line.should_start_newline,
+                                                            false,
+                                                        );
+                                                        let tmp_end = std::mem::replace(
+                                                            &mut self.line.should_end_newline,
+                                                            false,
+                                                        );
+                                                        self.event(
+                                                            ui, e, src_span, cache, options,
+                                                            col_w,
+                                                        );
+                                                        self.line.should_start_newline = tmp_start;
+                                                        self.line.should_end_newline = tmp_end;
+                                                    }
+                                                });
                                             }
                                         });
-                                    }
-                                });
-                            table.body(|mut body| {
-                                for (row_idx, row) in rows.into_iter().enumerate() {
-                                    let h = body_heights
-                                        .get(row_idx)
-                                        .copied()
-                                        .unwrap_or(cell_h);
-                                    body.row(h, |mut row_ui| {
-                                        for col in row {
-                                            row_ui.col(|ui| {
-                                                let col_w = ui.available_width();
-                                                for (e, src_span) in col {
-                                                    let tmp_start = std::mem::replace(
-                                                        &mut self.line.should_start_newline,
-                                                        false,
-                                                    );
-                                                    let tmp_end = std::mem::replace(
-                                                        &mut self.line.should_end_newline,
-                                                        false,
-                                                    );
-                                                    self.event(
-                                                        ui, e, src_span, cache, options, col_w,
-                                                    );
-                                                    self.line.should_start_newline = tmp_start;
-                                                    self.line.should_end_newline = tmp_end;
+                                    table.body(|mut body| {
+                                        for (row_idx, row) in rows.into_iter().enumerate() {
+                                            let h = body_heights
+                                                .get(row_idx)
+                                                .copied()
+                                                .unwrap_or(cell_h);
+                                            body.row(h, |mut row_ui| {
+                                                for col in row {
+                                                    row_ui.col(|ui| {
+                                                        let col_w = ui.available_width();
+                                                        for (e, src_span) in col {
+                                                            let tmp_start = std::mem::replace(
+                                                                &mut self.line.should_start_newline,
+                                                                false,
+                                                            );
+                                                            let tmp_end = std::mem::replace(
+                                                                &mut self.line.should_end_newline,
+                                                                false,
+                                                            );
+                                                            self.event(
+                                                                ui, e, src_span, cache, options,
+                                                                col_w,
+                                                            );
+                                                            self.line.should_start_newline =
+                                                                tmp_start;
+                                                            self.line.should_end_newline = tmp_end;
+                                                        }
+                                                    });
                                                 }
                                             });
                                         }
                                     });
-                                }
+                                });
                             });
                         });
-                    });
-                });
-            forward_shift_wheel_to_horizontal_scroll(ui, &mut scroll_out);
+                    forward_shift_wheel_to_horizontal_scroll(ui, &mut scroll_out);
+                    scroll_out
+                })
+                .inner;
             self.is_table = false;
             if events.peek().is_none() {
                 self.line.should_end_newline_forced = false;
@@ -1943,11 +1974,23 @@ impl CommonMarkViewerInternal {
         // ui.vertical() prevents the header/body Y-overlap quirk. Plain vertical wheel
         // stays with the outer document scroller (#22); Shift+wheel opts in to
         // horizontal table scrolling via `forward_shift_wheel_to_horizontal_scroll`.
-        let mut scroll_out = egui::ScrollArea::horizontal()
-            .id_salt(id.with("_scroll"))
-            .max_width(max_width)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
+        // Bound at `table_max_width` over the prose cap (#64), same as markdown tables.
+        let table_bound = options
+            .table_max_width
+            .map(|w| w as f32)
+            .unwrap_or(max_width);
+        // Same reading-column escape as markdown tables (#64): carve out a
+        // scope wider than the prose allocation, anchored at the cursor.
+        let mut table_scope_rect = ui.cursor();
+        table_scope_rect.max.x = table_scope_rect.min.x + table_bound;
+        table_scope_rect.max.y = ui.max_rect().bottom();
+        let scroll_out = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(table_scope_rect), |ui| {
+                let mut scroll_out = egui::ScrollArea::horizontal()
+                    .id_salt(id.with("_scroll"))
+                    .max_width(table_bound)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
                 ui.vertical(|ui| {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         let builder = egui_extras::TableBuilder::new(ui)
@@ -2052,7 +2095,10 @@ impl CommonMarkViewerInternal {
                     });
                 });
             });
-        forward_shift_wheel_to_horizontal_scroll(ui, &mut scroll_out);
+                forward_shift_wheel_to_horizontal_scroll(ui, &mut scroll_out);
+                scroll_out
+            })
+            .inner;
         self.line.try_insert_end(ui);
     }
 }

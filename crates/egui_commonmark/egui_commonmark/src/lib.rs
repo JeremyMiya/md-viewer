@@ -148,6 +148,14 @@ impl<'f> CommonMarkViewer<'f> {
         self
     }
 
+    /// Independent width bound for tables (markdown and HTML). Lets wide
+    /// tables use the full content pane while prose stays at the reading
+    /// column set by [`default_width`](Self::default_width).
+    pub fn table_max_width(mut self, width: Option<usize>) -> Self {
+        self.options.table_max_width = width;
+        self
+    }
+
     /// Show alt text when hovering over images. By default this is enabled.
     pub fn show_alt_text_on_hover(mut self, show: bool) -> Self {
         self.options.show_alt_text_on_hover = show;
