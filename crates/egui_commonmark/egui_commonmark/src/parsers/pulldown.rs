@@ -597,11 +597,11 @@ impl CommonMarkViewerInternal {
         let content_hash = Self::hash_content(text);
         if cache.get_cached_events(content_hash).is_none() {
             let math_enabled = options.math_fn.is_some() || cfg!(feature = "math");
+            // LaTeX-style \(...\) / \[...\] support (#60): delimiters are
+            // rewritten pre-parse on an in-memory copy and ranges are mapped
+            // back, so they stay valid against the original text.
             let owned_events: Vec<(pulldown_cmark::Event<'static>, Range<usize>)> =
-                pulldown_cmark::Parser::new_ext(text, parser_options_math(math_enabled))
-                    .into_offset_iter()
-                    .map(|(event, range)| (event.into_static(), range))
-                    .collect();
+                super::latex_delimiters::parse_events(text, math_enabled);
             cache.set_cached_events(content_hash, owned_events);
         }
 
@@ -734,13 +734,10 @@ impl CommonMarkViewerInternal {
                 // (`lib.rs:566 unreachable!()`). See docs/devlog/027.
                 let math_enabled =
                     options.math_fn.is_some() || cfg!(feature = "math");
-                sc.events = pulldown_cmark::Parser::new_ext(
-                    text,
-                    parser_options_math(math_enabled),
-                )
-                .into_offset_iter()
-                .map(|(e, r)| (e.into_static(), r))
-                .collect();
+                // Must produce byte-identical events to the cache-fill parse
+                // above — including any LaTeX delimiter rewrite (#60) — or
+                // split_points index into an unrelated stream (see devlog 027).
+                sc.events = super::latex_delimiters::parse_events(text, math_enabled);
                 sc.content_version = version;
                 // Content changed — cached split_points y-coords are no
                 // longer valid for this content. Drop them so the first
