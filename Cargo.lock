@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "egui_commonmark_backend_extended"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "egui",
  "egui_extras",
@@ -1596,7 +1596,7 @@ dependencies = [
 
 [[package]]
 name = "egui_commonmark_extended"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "egui",
  "egui_commonmark_backend_extended",
@@ -7962,4 +7962,4 @@ dependencies = [
 
 [[patch.unused]]
 name = "egui_commonmark_macros_extended"
-version = "0.25.0"
+version = "0.26.0"
