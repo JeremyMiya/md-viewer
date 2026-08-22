@@ -1200,6 +1200,11 @@ fn run_native_once(args: &Args) -> eframe::Result<()> {
             .with_inner_size([optimal_width, OPTIMAL_WINDOW_HEIGHT])
             .with_min_inner_size([400.0, 300.0])
             .with_title("Markdown Viewer")
+            // Wayland app_id: GNOME matches running windows to pinned dock
+            // icons via app_id (the Wayland WM_CLASS equivalent); without it
+            // the launcher shows a second generic icon (#62). Must match the
+            // StartupWMClass in the distributed .desktop file.
+            .with_app_id("md-viewer")
             .with_drag_and_drop(true),
         ..Default::default()
     };
