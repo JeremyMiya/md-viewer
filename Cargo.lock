@@ -1603,6 +1603,7 @@ dependencies = [
  "egui_extras",
  "emojis",
  "pulldown-cmark 0.13.0",
+ "resvg",
 ]
 
 [[package]]
