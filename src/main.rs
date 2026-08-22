@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -1180,6 +1181,15 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    fall_back_to_x11_if_wayland_socket_is_dead();
+    run_native_once(&args)
+}
+
+/// Build the native options and hand the app to eframe. Called once per
+/// process: if the event loop cannot be created, winit forbids a second
+/// attempt (`RecreationAttempt`), which is why backend selection is settled
+/// up front instead of via retry.
+fn run_native_once(args: &Args) -> eframe::Result<()> {
     // Calculate optimal window width assuming both sidebars are shown (the default)
     let optimal_width =
         CONTENT_OPTIMAL_WIDTH + EXPLORER_DEFAULT_WIDTH + OUTLINE_DEFAULT_WIDTH + PANEL_SEPARATORS;
@@ -1193,11 +1203,71 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    let file = args.file.clone();
+    let watch = !args.no_watch;
+
     eframe::run_native(
         "md-viewer",
         options,
-        Box::new(move |cc| Ok(Box::new(MarkdownApp::new(cc, args.file, !args.no_watch)))),
+        Box::new(move |cc| Ok(Box::new(MarkdownApp::new(cc, file, watch)))),
     )
+}
+
+/// winit 0.30 selects exactly one windowing backend from the environment and
+/// never falls back: a non-empty WAYLAND_DISPLAY/WAYLAND_SOCKET commits it to
+/// Wayland, and an unusable socket then aborts startup even when Xwayland is
+/// available (seen in strict snaps on Ubuntu 26.04, #65). Probe the socket
+/// before handing control to eframe; if it cannot be connected, clear the
+/// Wayland variables so winit picks X11 up front.
+#[cfg(unix)]
+fn fall_back_to_x11_if_wayland_socket_is_dead() {
+    // An inherited WAYLAND_SOCKET fd cannot be probed without consuming it;
+    // trust it and let libwayland report any problem.
+    if std::env::var_os("WAYLAND_SOCKET").is_some_and(|value| !value.is_empty()) {
+        return;
+    }
+
+    let display = std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .filter(|v| !v.is_empty());
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default();
+    let Some(path) = wayland_display_socket_path(display.as_deref(), &runtime_dir) else {
+        return;
+    };
+
+    if UnixStream::connect(&path).is_ok() {
+        return;
+    }
+
+    log::warn!(
+        "WAYLAND_DISPLAY points at {}, which cannot be connected to; falling back to X11",
+        path.display()
+    );
+    std::env::remove_var("WAYLAND_DISPLAY");
+    std::env::remove_var("WAYLAND_SOCKET");
+}
+
+#[cfg(not(unix))]
+fn fall_back_to_x11_if_wayland_socket_is_dead() {}
+
+/// Resolve the filesystem path of the Wayland socket from `WAYLAND_DISPLAY`
+/// and `XDG_RUNTIME_DIR`, mirroring libwayland's lookup rules: an absolute
+/// display name passes through, otherwise it is joined onto the runtime
+/// directory. Returns `None` when the pair does not describe a concrete
+/// socket — Wayland was never usable in that case, so there is nothing to
+/// probe or clear.
+fn wayland_display_socket_path(display: Option<&str>, runtime_dir: &OsStr) -> Option<PathBuf> {
+    let name = Path::new(display?);
+    if name.as_os_str().is_empty() {
+        return None;
+    }
+    if name.is_absolute() {
+        return Some(name.to_path_buf());
+    }
+    if runtime_dir.is_empty() {
+        return None;
+    }
+    Some(Path::new(runtime_dir).join(name))
 }
 
 /// Source of a lightbox texture. Mermaid pre-rasterizes its own texture so we
@@ -4349,6 +4419,31 @@ mod tests {
         assert_eq!(format_relative_time(now - 3 * 86_400, now), "3d ago");
         // Clock skew (future timestamp) must not underflow.
         assert_eq!(format_relative_time(now + 500, now), "just now");
+    }
+
+    #[test]
+    fn wayland_socket_path_mirrors_libwayland_lookup() {
+        assert_eq!(
+            wayland_display_socket_path(Some("wayland-0"), OsStr::new("/run/user/1000")),
+            Some(PathBuf::from("/run/user/1000/wayland-0"))
+        );
+        assert_eq!(
+            wayland_display_socket_path(Some("/custom/wayland-1"), OsStr::new("/run/user/1000")),
+            Some(PathBuf::from("/custom/wayland-1"))
+        );
+        // Nothing usable to probe when the variables are missing or empty.
+        assert_eq!(
+            wayland_display_socket_path(None, OsStr::new("/run/user/1000")),
+            None
+        );
+        assert_eq!(
+            wayland_display_socket_path(Some(""), OsStr::new("/run/user/1000")),
+            None
+        );
+        assert_eq!(
+            wayland_display_socket_path(Some("wayland-0"), OsStr::new("")),
+            None
+        );
     }
 
     #[test]
