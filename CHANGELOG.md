@@ -2,6 +2,19 @@
 
 All notable changes to markdown-viewer will be documented in this file.
 
+## [0.1.16] - 2026-08-22
+
+### Features
+
+- **Tables use the full content pane (#64, PR #67).** In reading mode the whole document is laid out at the prose width (~600 px), and wide tables were clipped at that column with their right side unreachable. Markdown and HTML tables now escape the reading column and span the entire content pane, horizontally scrolling within it when still wider; prose keeps the reading width and small tables continue to hug their columns.
+- **LaTeX `\operatorname` / `\operatorname*` render (PR #58, contributed by [@RichardCao](https://github.com/RichardCao)).** amsmath named operators emitted by mitex map to Typst `math.op`, so formulas like `r_{\text{dir}}=\operatorname{sign}(x)` no longer fail.
+
+### Bug Fixes
+
+- **App starts on Ubuntu 26.04 Wayland sessions where the snap cannot reach the compositor (#65, PR #66).** winit commits to exactly one backend from the environment and never falls back, so an unusable `WAYLAND_DISPLAY` aborted startup even with working Xwayland. md-viewer now probes the Wayland socket before creating the event loop and falls back to X11 when it cannot be connected.
+- **Linked SVG badges render completely (PR #63, contributed by [@RichardCao](https://github.com/RichardCao)).** Three compounding issues in badge rendering fixed: image-only links no longer reset the wrapped-row cursor (badges overlapped), SVGs served with `image/svg+xml` but without a `.svg` URL extension are decoded via a MIME-aware loader, and the `sans-serif` alias resolves through Fontconfig when fontdb maps it to an uninstalled face.
+- **Fonts are discovered from the system instead of hard-coded paths (#59, PR #61, contributed by [@RichardCao](https://github.com/RichardCao)).** A paired regular/bold sans family plus CJK/script fallbacks are selected via fontdb with locale-aware SC/TC/JP/KR priority and glyph-coverage checks; TTC face indices are preserved.
+
 ## [0.1.15] - 2026-07-23
 
 ### Bug Fixes
