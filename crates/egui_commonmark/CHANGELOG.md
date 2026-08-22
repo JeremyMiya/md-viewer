@@ -1,13 +1,15 @@
 # egui_commonmark changelog
 
-## Unreleased
+## 0.27.0
 
 ### Added
 - `table_max_width` option: markdown/HTML tables may exceed the prose reading column and span the full content pane (#64).
 - MIME-aware SVG loader for SVG URLs without a `.svg` extension; image-only links keep the wrapped-row cursor (#63).
+- LaTeX-style `\(...\)` / `\[...\]` math delimiters are rewritten pre-parse with full offset remapping, so they render like `$...$` / `$$...$$` (#60).
 
 ### Fixed
 - amsmath `\operatorname{}` / `\operatorname*{}` render as named operators (#58).
+- Image-only links no longer reset the wrapped-row cursor, so linked badges stop overlapping (#63).
 
 ## 0.22.0 - 2025-10-09
 

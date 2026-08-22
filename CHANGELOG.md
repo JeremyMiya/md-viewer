@@ -2,6 +2,16 @@
 
 All notable changes to markdown-viewer will be documented in this file.
 
+## [0.1.17] - 2026-08-22
+
+### Features
+
+- **LaTeX `\(...\)` and `\[...\]` math delimiters now render (#60, PR #73).** Markdown written in LaTeX/Pandoc style previously stayed literal; paired delimiters are converted on an in-memory copy before parsing and every event range is mapped back to the original text, so search highlighting stays exact. Inline code, fenced and indented code blocks, and raw HTML are never converted; escaped (`\\(`) and unmatched delimiters stay literal.
+
+### Bug Fixes
+
+- **GNOME dock icon matches the running window (#62, PR #72).** The window never reported a Wayland `app_id`, so GNOME could not associate it with the pinned `.desktop` entry and showed a second generic icon. The app now sets `app_id: md-viewer`, matching the shipped desktop file's `StartupWMClass`.
+
 ## [0.1.16] - 2026-08-22
 
 ### Features
