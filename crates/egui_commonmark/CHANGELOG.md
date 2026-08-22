@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+- `table_max_width` option: markdown/HTML tables may exceed the prose reading column and span the full content pane (#64).
+- MIME-aware SVG loader for SVG URLs without a `.svg` extension; image-only links keep the wrapped-row cursor (#63).
+
+### Fixed
+- amsmath `\operatorname{}` / `\operatorname*{}` render as named operators (#58).
+
 ## 0.22.0 - 2025-10-09
 
 ### Changed
