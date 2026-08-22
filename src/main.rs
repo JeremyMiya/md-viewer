@@ -2823,6 +2823,10 @@ impl MarkdownApp {
                     .default_implicit_uri_scheme(&tab.base_uri)
                     .max_image_width(Some(800))
                     .default_width(default_width)
+                    // Tables are not bound by the reading column (#64): a wide
+                    // table spans the whole content pane and scrolls there,
+                    // while prose keeps the reading width.
+                    .table_max_width(Some(content_rect.width() as usize))
                     .indentation_spaces(2)
                     .use_strong_font_family(true)
                     .show_alt_text_on_hover(true)
