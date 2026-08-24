@@ -314,7 +314,7 @@ struct FileExplorer {
     tree: Vec<FileTreeNode>,
     expanded_dirs: HashSet<PathBuf>,
     sort_order: SortOrder,
-    /// Receiver for async directory scan results (GVFS paths scan in background)
+    /// Receiver for asynchronous root-directory scan results.
     pending_scan: Option<Receiver<ExplorerScanResult>>,
 }
 
@@ -409,8 +409,7 @@ impl FileExplorer {
             .unwrap_or(false)
     }
 
-    /// Set root directory and rescan (shallow).
-    /// For GVFS paths, scan runs in a background thread to avoid blocking the UI.
+    /// Set root directory and start a shallow background scan.
     fn set_root(&mut self, path: PathBuf) {
         // Convert empty path to current directory
         let path = if path.as_os_str().is_empty() {
@@ -419,26 +418,32 @@ impl FileExplorer {
             path
         };
         self.root = Some(path.clone());
-        if is_gvfs_path(&path) {
-            // Scan in background thread — tree populates when ready
-            let sort_order = self.sort_order;
-            let expanded_dirs = self.expanded_dirs.clone();
-            let (tx, rx) = mpsc::channel();
-            std::thread::Builder::new()
-                .name("gvfs-scan".into())
-                .spawn(move || {
-                    let mut tree = Self::scan_directory_shallow(&path, sort_order);
-                    Self::restore_expanded_children(&mut tree, &expanded_dirs, sort_order);
-                    let _ = tx.send(ExplorerScanResult {
-                        root: path,
-                        sort_order,
-                        tree,
-                    });
-                })
-                .expect("failed to spawn GVFS scan thread");
-            self.pending_scan = Some(rx);
-        } else {
+        if !self.start_root_scan(path.clone(), "explorer-scan") {
             self.tree = Self::scan_directory_shallow(&path, self.sort_order);
+            Self::restore_expanded_children(&mut self.tree, &self.expanded_dirs, self.sort_order);
+        }
+    }
+
+    fn start_root_scan(&mut self, path: PathBuf, thread_name: &str) -> bool {
+        let sort_order = self.sort_order;
+        let expanded_dirs = self.expanded_dirs.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name(thread_name.to_owned())
+            .spawn(move || {
+                let mut tree = Self::scan_directory_shallow(&path, sort_order);
+                Self::restore_expanded_children(&mut tree, &expanded_dirs, sort_order);
+                let _ = tx.send(ExplorerScanResult {
+                    root: path,
+                    sort_order,
+                    tree,
+                });
+            });
+        if spawned.is_ok() {
+            self.pending_scan = Some(rx);
+            true
+        } else {
+            false
         }
     }
 
@@ -467,29 +472,10 @@ impl FileExplorer {
         true
     }
 
-    /// Refresh the file tree (clears loaded state, rescans shallowly).
-    /// For GVFS paths, runs in background to avoid blocking the UI thread.
+    /// Refresh the file tree in the background.
     fn refresh(&mut self) {
         if let Some(root) = &self.root.clone() {
-            if is_gvfs_path(root) {
-                // Re-scan in background
-                let sort_order = self.sort_order;
-                let root = root.clone();
-                let expanded_dirs = self.expanded_dirs.clone();
-                let (tx, rx) = mpsc::channel();
-                std::thread::Builder::new()
-                    .name("gvfs-refresh".into())
-                    .spawn(move || {
-                        let mut tree = Self::scan_directory_shallow(&root, sort_order);
-                        Self::restore_expanded_children(&mut tree, &expanded_dirs, sort_order);
-                        let _ = tx.send(ExplorerScanResult {
-                            root,
-                            sort_order,
-                            tree,
-                        });
-                    })
-                    .expect("failed to spawn GVFS refresh thread");
-                self.pending_scan = Some(rx);
+            if self.start_root_scan(root.clone(), "explorer-refresh") {
                 return;
             }
             self.tree = Self::scan_directory_shallow(root, self.sort_order);
@@ -3654,10 +3640,10 @@ impl eframe::App for MarkdownApp {
             self.reload_changed_tabs(changed_paths);
         }
 
-        // Poll for async GVFS directory scan completion
+        // Poll for asynchronous Explorer root scan completion.
         if self.file_explorer.pending_scan.is_some() {
             if self.file_explorer.poll_pending_scan() {
-                log::info!("GVFS directory scan completed");
+                log::info!("Explorer directory scan completed");
             }
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -4748,6 +4734,37 @@ mod tests {
         };
 
         assert!(explorer.poll_pending_scan());
+        assert!(explorer
+            .get_children(&expanded)
+            .is_some_and(|children| children.iter().any(|node| node.name() == "guide.md")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_root_scan_runs_asynchronously_and_restores_expansion() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-local-explorer-scan-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        let expanded = root.join("docs");
+        fs::create_dir_all(&expanded).unwrap();
+        fs::write(expanded.join("guide.md"), "# Guide").unwrap();
+
+        let mut explorer = FileExplorer {
+            expanded_dirs: HashSet::from([expanded.clone()]),
+            ..Default::default()
+        };
+        explorer.set_root(root.clone());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while explorer.pending_scan.is_some() && Instant::now() < deadline {
+            explorer.poll_pending_scan();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(explorer.pending_scan.is_none());
         assert!(explorer
             .get_children(&expanded)
             .is_some_and(|children| children.iter().any(|node| node.name() == "guide.md")));
