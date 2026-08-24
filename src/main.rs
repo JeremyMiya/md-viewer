@@ -501,6 +501,53 @@ impl FileExplorer {
         }
     }
 
+    /// Rescan only one changed directory while preserving the rest of the tree.
+    fn refresh_directory(&mut self, directory: &Path) {
+        let Some(root) = self.root.as_ref() else {
+            return;
+        };
+        if directory == root {
+            self.tree = Self::scan_directory_shallow(&root.clone(), self.sort_order);
+        } else {
+            let mut replacement = Some(Self::scan_directory_shallow(
+                &directory.to_path_buf(),
+                self.sort_order,
+            ));
+            if !Self::replace_directory_children(&mut self.tree, directory, &mut replacement) {
+                return;
+            }
+        }
+
+        // Restore expanded descendants from shallowest to deepest so their
+        // parents exist before lazy children are loaded.
+        let mut expanded: Vec<PathBuf> = self.expanded_dirs.iter().cloned().collect();
+        expanded.sort_by_key(|path| path.components().count());
+        for path in expanded {
+            self.load_children(&path);
+        }
+    }
+
+    fn replace_directory_children(
+        nodes: &mut [FileTreeNode],
+        directory: &Path,
+        replacement: &mut Option<Vec<FileTreeNode>>,
+    ) -> bool {
+        for node in nodes {
+            if let FileTreeNode::Directory { path, children, .. } = node {
+                if path == directory {
+                    *children = replacement.take();
+                    return true;
+                }
+                if let Some(children) = children {
+                    if Self::replace_directory_children(children, directory, replacement) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Load children for a specific directory (lazy loading)
     fn load_children(&mut self, dir_path: &PathBuf) {
         Self::load_children_in_tree(&mut self.tree, dir_path, self.sort_order);
@@ -2085,7 +2132,7 @@ impl MarkdownApp {
 
     fn reload_changed_tabs(&mut self, changed_paths: Vec<PathBuf>) {
         let now = Instant::now();
-        let mut refresh_tree = false;
+        let mut refresh_directories = HashSet::new();
         // If the active tab gets reloaded while the find bar is open, its
         // `search_matches` will be cleared by `Tab::reload`. Force a rebuild
         // on the next frame by invalidating the cache-validity shadow state.
@@ -2100,7 +2147,9 @@ impl MarkdownApp {
             if let Some(root) = &self.file_explorer.root {
                 // Check if the changed path is within the explorer root
                 if path.starts_with(root) {
-                    refresh_tree = true;
+                    if let Some(parent) = path.parent() {
+                        refresh_directories.insert(parent.to_path_buf());
+                    }
                 }
 
                 let mut current = path.parent();
@@ -2141,10 +2190,10 @@ impl MarkdownApp {
             }
         }
 
-        // Refresh the file explorer tree if any changes were within the explorer root
-        if refresh_tree {
-            log::info!("Refreshing file explorer tree");
-            self.file_explorer.refresh();
+        // Refresh only affected parents instead of rebuilding the entire tree.
+        for directory in refresh_directories {
+            log::debug!("Refreshing explorer directory: {:?}", directory);
+            self.file_explorer.refresh_directory(&directory);
         }
     }
 
@@ -4923,6 +4972,46 @@ mod tests {
         assert!(explorer
             .get_children(&expanded)
             .is_some_and(|children| children.iter().any(|node| node.name() == "guide.md")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn targeted_explorer_refresh_preserves_unrelated_subtrees() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-targeted-refresh-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        let docs = root.join("docs");
+        let notes = root.join("notes");
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(docs.join("old.md"), "# Old").unwrap();
+        fs::write(notes.join("keep.md"), "# Keep").unwrap();
+
+        let mut explorer = FileExplorer::default();
+        explorer.set_root(root.clone());
+        // set_root scans asynchronously since #84: drain the pending scan
+        // before interacting with the tree.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while explorer.pending_scan.is_some() && Instant::now() < deadline {
+            explorer.poll_pending_scan();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        explorer.toggle_expanded(&docs);
+        explorer.toggle_expanded(&notes);
+        fs::write(docs.join("new.md"), "# New").unwrap();
+
+        explorer.refresh_directory(&docs);
+
+        assert!(explorer
+            .get_children(&docs)
+            .is_some_and(|children| children.iter().any(|node| node.name() == "new.md")));
+        assert!(explorer
+            .get_children(&notes)
+            .is_some_and(|children| children.iter().any(|node| node.name() == "keep.md")));
+        assert!(explorer.is_expanded(&docs));
+        assert!(explorer.is_expanded(&notes));
 
         fs::remove_dir_all(root).unwrap();
     }
