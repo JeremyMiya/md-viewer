@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
-use egui_commonmark_extended::{CommonMarkCache, CommonMarkViewer};
+use egui_commonmark_extended::{header_position_key, CommonMarkCache, CommonMarkViewer};
 use notify::{PollWatcher, RecommendedWatcher};
 use notify_debouncer_mini::{new_debouncer, new_debouncer_opt, DebouncedEventKind, Debouncer};
 use regex::Regex;
@@ -31,9 +31,6 @@ const APP_KEY: &str = "md-viewer-state";
 // Welcome page recent-files: how many to keep, and how many to show before "Show more".
 const RECENT_FILES_CAP: usize = 20;
 const RECENT_SHOWN: usize = 6;
-
-/// Compiled regex for parsing markdown headers (lazy, compiled once)
-static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})\s+(.+)$").unwrap());
 
 /// Compiled regex for parsing markdown links (lazy, compiled once)
 static LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]*)\]\(([^)]+)\)").unwrap());
@@ -160,34 +157,16 @@ struct PersistedState {
     recent_files: Option<Vec<RecentEntry>>,
 }
 
-/// Build the composite cache key for a header position lookup. Combines the
-/// normalized (lowercased) title with the occurrence index so duplicate-titled
-/// headers map to distinct entries in `CommonMarkCache::header_positions`.
-/// Both the parser (which assigns `nth_with_same_text` to each `Header`) and
-/// the renderer (which records positions while painting) use this function so
-/// keys agree across the read/write boundary.
-pub fn header_position_key(normalized_title: &str, nth_with_same_text: usize) -> String {
-    if nth_with_same_text == 0 {
-        normalized_title.to_string()
-    } else {
-        format!("{normalized_title}#{nth_with_same_text}")
-    }
-}
-
 /// Represents a markdown header for the outline
 #[derive(Clone)]
 struct Header {
     level: u8,
     title: String,
-    /// Pre-computed truncated display title for outline sidebar
+    /// Pre-computed truncated display title for outline sidebar.
     display_title: String,
-    /// Pre-computed lowercase key for header position cache lookups
-    normalized_title: String,
-    /// Occurrence index among headers with the same `normalized_title`.
-    /// The first `## Installation` is 0, the second is 1, etc. Combined
-    /// with `normalized_title` into the composite cache key so duplicates
-    /// scroll to the correct (different) y positions.
-    nth_with_same_text: usize,
+    /// Byte offset of the heading's Start event. The renderer records the
+    /// position under the same source-stable key, independent of formatting.
+    source_start: usize,
     line_number: usize,
 }
 
@@ -904,40 +883,74 @@ fn truncate_display_name(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Parse markdown headers from content, skipping code blocks.
+/// Parse headings with the same CommonMark rules used by the renderer.
 fn parse_headers(content: &str) -> ParsedHeaders {
-    let re = &*HEADER_RE;
-    let mut all_headers: Vec<Header> = Vec::new();
-    let mut in_code_block = false;
+    use pulldown_cmark::{Event, HeadingLevel, Tag, TagEnd};
 
-    for (line_number, line) in content.lines().enumerate() {
-        if line.trim_start().starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
+    fn level_number(level: HeadingLevel) -> u8 {
+        match level {
+            HeadingLevel::H1 => 1,
+            HeadingLevel::H2 => 2,
+            HeadingLevel::H3 => 3,
+            HeadingLevel::H4 => 4,
+            HeadingLevel::H5 => 5,
+            HeadingLevel::H6 => 6,
         }
+    }
 
-        if in_code_block {
-            continue;
-        }
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(content.match_indices('\n').map(|(offset, _)| offset + 1))
+        .collect();
+    let mut all_headers = Vec::new();
+    let mut current: Option<(u8, usize, usize, String)> = None;
 
-        if let Some(caps) = re.captures(line) {
-            let title = caps[2].trim().to_string();
-            let normalized_title = title.to_lowercase();
-            let display_title = truncate_display_name(&title, 35);
-            // Count prior headers with the same normalized title so each
-            // duplicate gets a distinct composite cache key.
-            let nth_with_same_text = all_headers
-                .iter()
-                .filter(|h| h.normalized_title == normalized_title)
-                .count();
-            all_headers.push(Header {
-                level: caps[1].len() as u8,
-                title,
-                display_title,
-                normalized_title,
-                nth_with_same_text,
-                line_number,
-            });
+    for (event, range) in
+        pulldown_cmark::Parser::new_ext(content, pulldown_cmark::Options::all()).into_offset_iter()
+    {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                let line_number = line_starts
+                    .partition_point(|line_start| *line_start <= range.start)
+                    .saturating_sub(1);
+                current = Some((level_number(level), range.start, line_number, String::new()));
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, source_start, line_number, title)) = current.take() {
+                    let title = title.trim().to_owned();
+                    if !title.is_empty() {
+                        all_headers.push(Header {
+                            level,
+                            display_title: truncate_display_name(&title, 35),
+                            title,
+                            source_start,
+                            line_number,
+                        });
+                    }
+                }
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push_str(&text);
+                }
+            }
+            Event::InlineMath(text) | Event::DisplayMath(text) => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push_str(&text);
+                }
+            }
+            Event::FootnoteReference(label) => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push('[');
+                    title.push_str(&label);
+                    title.push(']');
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push(' ');
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2617,11 +2630,9 @@ impl MarkdownApp {
         // Calculate scroll target if header was clicked
         if let Some(idx) = clicked_header_index {
             if let Some(header) = tab.outline_headers.get(idx) {
-                // Composite key disambiguates duplicate-titled headers (e.g. two
-                // `## Installation` sections). Each occurrence has its own
-                // `nth_with_same_text` index assigned at parse time, and the
-                // renderer records positions under the same composite scheme.
-                let key = header_position_key(&header.normalized_title, header.nth_with_same_text);
+                // The renderer records the same source-stable key, so formatting
+                // and duplicate display titles cannot redirect the click.
+                let key = header_position_key(header.source_start);
                 // Try to get actual rendered position from cache first.
                 // With virtualization, the cache may hold a stale value from a
                 // partial render — record the key for the post-render
@@ -4682,20 +4693,22 @@ mod tests {
     }
 
     #[test]
-    fn shortcode_heading_parser_keeps_raw_identity_and_duplicate_index() {
-        let parsed = parse_headers("# Doc\n\n## Pin :pushpin:\n\n## Pin :pushpin:\n");
+    fn heading_parser_keeps_raw_shortcode_and_source_identity() {
+        let markdown = "# Doc\n\n## Pin :pushpin:\n\n## Pin :pushpin:\n";
+        let parsed = parse_headers(markdown);
         assert_eq!(parsed.outline_headers.len(), 3);
         assert_eq!(parsed.outline_headers[1].title, "Pin :pushpin:");
-        assert_eq!(parsed.outline_headers[1].normalized_title, "pin :pushpin:");
-        assert_eq!(parsed.outline_headers[1].nth_with_same_text, 0);
-        assert_eq!(parsed.outline_headers[2].normalized_title, "pin :pushpin:");
-        assert_eq!(parsed.outline_headers[2].nth_with_same_text, 1);
         assert_eq!(
-            header_position_key(
-                &parsed.outline_headers[2].normalized_title,
-                parsed.outline_headers[2].nth_with_same_text,
-            ),
-            "pin :pushpin:#1"
+            parsed.outline_headers[1].source_start,
+            markdown.find("## Pin").unwrap()
+        );
+        assert_eq!(
+            parsed.outline_headers[2].source_start,
+            markdown.rfind("## Pin").unwrap()
+        );
+        assert_eq!(
+            header_position_key(parsed.outline_headers[1].source_start),
+            "heading-source:7"
         );
     }
 
@@ -4703,9 +4716,25 @@ mod tests {
     fn unknown_shortcode_heading_stays_raw() {
         let parsed = parse_headers("# Doc\n\n## Pin :not_a_gemoji:\n");
         assert_eq!(parsed.outline_headers[1].title, "Pin :not_a_gemoji:");
+    }
+
+    #[test]
+    fn heading_parser_uses_commonmark_for_formatting_links_and_setext() {
+        let markdown = concat!(
+            "# **Bold** and `code` [link](guide.md)\n\n",
+            "Setext title\n---\n\n",
+            "~~~markdown\n# Hidden heading\n~~~\n",
+        );
+        let parsed = parse_headers(markdown);
+
+        assert_eq!(parsed.outline_headers.len(), 2);
+        assert_eq!(parsed.outline_headers[0].title, "Bold and code link");
+        assert_eq!(parsed.outline_headers[0].level, 1);
+        assert_eq!(parsed.outline_headers[1].title, "Setext title");
+        assert_eq!(parsed.outline_headers[1].level, 2);
         assert_eq!(
-            parsed.outline_headers[1].normalized_title,
-            "pin :not_a_gemoji:"
+            parsed.outline_headers[1].source_start,
+            markdown.find("Setext").unwrap()
         );
     }
 
