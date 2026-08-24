@@ -977,7 +977,11 @@ fn resolve_local_link_path(destination: &str, document_dir: &Path) -> Option<Pat
         return url::Url::parse(destination).ok()?.to_file_path().ok();
     }
 
-    let path = Path::new(destination.split('#').next().unwrap_or(destination));
+    let encoded_path = destination.split('#').next().unwrap_or(destination);
+    let decoded_path = percent_encoding::percent_decode_str(encoded_path)
+        .decode_utf8()
+        .ok()?;
+    let path = Path::new(decoded_path.as_ref());
     Some(if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -4945,6 +4949,32 @@ mod tests {
         let links = parse_local_links(&content, &document);
 
         assert_eq!(links, vec![absolute.to_string(), file_uri]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commonmark_reference_with_encoded_path_is_registered() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-reference-link-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        fs::create_dir_all(root.join("docs with spaces")).unwrap();
+        let document = root.join("index.md");
+        fs::write(&document, "# Index").unwrap();
+        fs::write(root.join("docs with spaces/guide(1).md"), "# Guide").unwrap();
+
+        let content =
+            "Read [the guide][guide].\n\n[guide]: docs%20with%20spaces/guide(1).md \"Title\"";
+        assert_eq!(
+            parse_local_links(content, &document),
+            vec!["docs%20with%20spaces/guide(1).md"]
+        );
+        assert!(
+            resolve_local_link_path("docs%20with%20spaces/guide(1).md", &root)
+                .is_some_and(|path| path.is_file())
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 
