@@ -41,6 +41,10 @@ static LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]*)\]\(([
 const MAX_WATCHER_RETRIES: u32 = 3;
 const FLASH_DURATION_MS: u64 = 600;
 
+fn next_watcher_retry(current: u32) -> Option<u32> {
+    (current < MAX_WATCHER_RETRIES).then(|| current + 1)
+}
+
 // Optimal widths for initial window sizing (based on typography research)
 // Content: 600px optimal for 55-75 CPL readability
 // Explorer: 200px default with 16px inner margins
@@ -1728,7 +1732,14 @@ impl MarkdownApp {
         }
     }
 
+    /// Start watching because of a user action or configuration change.
     fn start_watching(&mut self) {
+        self.watcher_retry_count = 0;
+        self.start_watching_attempt();
+    }
+
+    /// Construct watchers without resetting the recovery-attempt counter.
+    fn start_watching_attempt(&mut self) {
         self.stop_watching();
 
         let tab_paths = self.get_open_tab_paths();
@@ -1863,20 +1874,24 @@ impl MarkdownApp {
             // Bridge thread: forward events and wake egui on demand
             let (bridge_tx, bridge_rx) = mpsc::channel();
             let ctx = self.egui_ctx.clone();
-            std::thread::Builder::new()
+            let bridge = std::thread::Builder::new()
                 .name("watcher-bridge".into())
                 .spawn(move || {
                     while let Ok(event) = debouncer_rx.recv() {
                         let _ = bridge_tx.send(event);
                         ctx.request_repaint();
                     }
-                })
-                .expect("failed to spawn watcher bridge thread");
+                });
+
+            if let Err(error) = bridge {
+                log::error!("Failed to spawn watcher bridge thread: {error}");
+                self.error_message = Some(format!("Failed to start file watcher bridge: {error}"));
+                return;
+            }
 
             self.watcher = Some(fw);
             self.watcher_rx = Some(bridge_rx);
             self.watch_enabled = true;
-            self.watcher_retry_count = 0;
         } else {
             log::error!("Failed to create any file watcher");
             self.error_message = Some("Failed to create file watcher".to_string());
@@ -1987,15 +2002,18 @@ impl MarkdownApp {
             // Attempt recovery if watching is enabled and there's something to watch
             // Check actual tabs and explorer root, not watched_paths (which may be empty after failure)
             let has_watchable = !self.tabs.is_empty() || self.file_explorer.root.is_some();
-            if self.watch_enabled && has_watchable && self.watcher_retry_count < MAX_WATCHER_RETRIES
-            {
-                log::info!(
-                    "Attempting to recover file watcher (attempt {})",
-                    self.watcher_retry_count + 1
-                );
-                self.watcher_retry_count += 1;
-                self.start_watching();
-                self.egui_ctx.request_repaint_after(Duration::from_secs(2));
+            if self.watch_enabled && has_watchable {
+                if let Some(attempt) = next_watcher_retry(self.watcher_retry_count) {
+                    self.watcher_retry_count = attempt;
+                    log::info!("Attempting to recover file watcher (attempt {attempt})");
+                    self.start_watching_attempt();
+                    self.egui_ctx.request_repaint_after(Duration::from_secs(2));
+                } else {
+                    self.error_message = Some(format!(
+                        "File watcher failed after {MAX_WATCHER_RETRIES} retries"
+                    ));
+                    self.watch_enabled = false;
+                }
             }
             return Vec::new();
         };
@@ -2018,13 +2036,10 @@ impl MarkdownApp {
                     self.watcher = None;
                     self.watcher_rx = None;
 
-                    if self.watcher_retry_count < MAX_WATCHER_RETRIES {
-                        self.watcher_retry_count += 1;
-                        log::info!(
-                            "Attempting watcher recovery (attempt {})",
-                            self.watcher_retry_count
-                        );
-                        self.start_watching();
+                    if let Some(attempt) = next_watcher_retry(self.watcher_retry_count) {
+                        self.watcher_retry_count = attempt;
+                        log::info!("Attempting watcher recovery (attempt {attempt})");
+                        self.start_watching_attempt();
                         self.egui_ctx.request_repaint_after(Duration::from_secs(2));
                     } else {
                         self.error_message = Some(format!(
@@ -4811,5 +4826,14 @@ mod tests {
             keyboard_scroll_target(25.0, 500.0, 300.0, KeyboardScrollAction::LineDown),
             0.0
         );
+    }
+
+    #[test]
+    fn watcher_retry_sequence_stops_at_configured_limit() {
+        assert_eq!(next_watcher_retry(0), Some(1));
+        assert_eq!(next_watcher_retry(1), Some(2));
+        assert_eq!(next_watcher_retry(2), Some(3));
+        assert_eq!(next_watcher_retry(3), None);
+        assert_eq!(next_watcher_retry(u32::MAX), None);
     }
 }
