@@ -326,6 +326,35 @@ mod tests {
     }
 
     #[test]
+    fn table_formula_keeps_command_before_closing_delimiter() {
+        let text = concat!(
+            "| formula |\n|---|\n",
+            r"| \(D_t+\epsilon\) |",
+            "\n",
+            r"| \(a_t/(D_t^{opp}+\epsilon)\) |",
+            "\n",
+        );
+        let formulas: Vec<_> = parse_events(text, true)
+            .into_iter()
+            .filter_map(|(event, range)| match event {
+                Event::InlineMath(tex) => Some((tex.into_string(), text[range].to_string())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            formulas,
+            [
+                (r"D_t+\epsilon".into(), r"\(D_t+\epsilon\)".into()),
+                (
+                    r"a_t/(D_t^{opp}+\epsilon)".into(),
+                    r"\(a_t/(D_t^{opp}+\epsilon)\)".into(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn display_pair_across_lines_converts() {
         let text = "\\[\nr_a=1\n\\]";
         let (event, slice) =
