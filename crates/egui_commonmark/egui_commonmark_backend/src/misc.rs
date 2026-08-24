@@ -147,6 +147,12 @@ impl CommonMarkOptions<'_> {
 /// Font family name used for Markdown strong text when the app registers a bold face.
 pub const STRONG_FONT_FAMILY: &str = "MarkdownStrong";
 
+/// Stable cache key for a heading position, derived from its source byte offset.
+/// This does not depend on formatting, emoji expansion, or duplicate titles.
+pub fn header_position_key(source_start: usize) -> String {
+    format!("heading-source:{source_start}")
+}
+
 #[derive(Default, Clone)]
 pub struct Style {
     pub heading: Option<u8>,
