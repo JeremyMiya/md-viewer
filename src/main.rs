@@ -41,6 +41,10 @@ static LINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([^\]]*)\]\(([
 const MAX_WATCHER_RETRIES: u32 = 3;
 const FLASH_DURATION_MS: u64 = 600;
 
+fn next_watcher_retry(current: u32) -> Option<u32> {
+    (current < MAX_WATCHER_RETRIES).then(|| current + 1)
+}
+
 // Optimal widths for initial window sizing (based on typography research)
 // Content: 600px optimal for 55-75 CPL readability
 // Explorer: 200px default with 16px inner margins
@@ -693,10 +697,10 @@ impl Tab {
             .unwrap_or_else(|| "file://".to_string())
     }
 
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf) -> io::Result<Self> {
         // Canonicalize path for consistent comparison with watcher events
         let path = path.canonicalize().unwrap_or(path);
-        let content = fs::read_to_string(&path).unwrap_or_default();
+        let content = String::from_utf8_lossy(&fs::read(&path)?).into_owned();
         let parsed = parse_headers(&content);
         let local_links = parse_local_links(&content);
         let content_lines = content.lines().count();
@@ -707,7 +711,7 @@ impl Tab {
             cache.add_link_hook(link);
         }
 
-        Self {
+        Ok(Self {
             id: egui::Id::new(&path),
             path,
             content,
@@ -728,7 +732,7 @@ impl Tab {
             history_forward: Vec::new(),
             search_matches: Vec::new(),
             content_version: 1,
-        }
+        })
     }
 
     fn title(&self) -> String {
@@ -738,32 +742,10 @@ impl Tab {
             .unwrap_or_else(|| "Unknown".to_string())
     }
 
-    fn reload(&mut self) {
-        if !self.path.exists() {
-            return;
-        }
-
-        if let Ok(bytes) = fs::read(&self.path) {
-            let content = String::from_utf8_lossy(&bytes);
-            self.content_lines = content.lines().count();
-            self.content = content.into_owned();
-            self.cache = CommonMarkCache::default();
-            self.content_version = self.content_version.wrapping_add(1);
-            self.base_uri = Self::compute_base_uri(&self.path);
-
-            let parsed = parse_headers(&self.content);
-            self.document_title = parsed.document_title;
-            self.outline_headers = parsed.outline_headers;
-            self.collapsed_headers.clear();
-
-            self.local_links = parse_local_links(&self.content);
-            for link in &self.local_links {
-                self.cache.add_link_hook(link);
-            }
-
-            // Stale byte ranges; caller rebuilds if search bar is open
-            self.search_matches.clear();
-        }
+    fn reload(&mut self) -> io::Result<()> {
+        let content = String::from_utf8_lossy(&fs::read(&self.path)?).into_owned();
+        self.apply_loaded_content(self.path.clone(), content, false);
+        Ok(())
     }
 
     /// Rebuild `search_matches` for `query`. Empty query clears matches.
@@ -771,45 +753,46 @@ impl Tab {
         self.search_matches = find_matches(&self.content, query);
     }
 
-    fn load_file(&mut self, path: &PathBuf) {
-        if !path.exists() {
-            return;
-        }
-
-        if let Ok(bytes) = fs::read(path) {
-            let content = String::from_utf8_lossy(&bytes);
-            self.content_lines = content.lines().count();
-            self.content = content.into_owned();
-            self.path = path.clone();
-            self.id = egui::Id::new(path);
-            self.cache = CommonMarkCache::default();
-            self.content_version = self.content_version.wrapping_add(1);
-            self.scroll_offset = 0.0;
-            self.pending_scroll_offset = None;
-            self.base_uri = Self::compute_base_uri(&self.path);
-
-            let parsed = parse_headers(&self.content);
-            self.document_title = parsed.document_title;
-            self.outline_headers = parsed.outline_headers;
-            self.collapsed_headers.clear();
-
-            self.local_links = parse_local_links(&self.content);
-            for link in &self.local_links {
-                self.cache.add_link_hook(link);
-            }
-
-            // Stale byte ranges; caller rebuilds if search bar is open
-            self.search_matches.clear();
-        }
+    fn load_file(&mut self, path: &Path) -> io::Result<()> {
+        let content = String::from_utf8_lossy(&fs::read(path)?).into_owned();
+        self.apply_loaded_content(path.to_path_buf(), content, true);
+        Ok(())
     }
 
-    fn navigate_to_link(&mut self, link: &str) {
+    fn apply_loaded_content(&mut self, path: PathBuf, content: String, reset_scroll: bool) {
+        self.content_lines = content.lines().count();
+        self.content = content;
+        self.path = path;
+        self.id = egui::Id::new(&self.path);
+        self.cache = CommonMarkCache::default();
+        self.content_version = self.content_version.wrapping_add(1);
+        if reset_scroll {
+            self.scroll_offset = 0.0;
+            self.pending_scroll_offset = None;
+        }
+        self.base_uri = Self::compute_base_uri(&self.path);
+
+        let parsed = parse_headers(&self.content);
+        self.document_title = parsed.document_title;
+        self.outline_headers = parsed.outline_headers;
+        self.collapsed_headers.clear();
+
+        self.local_links = parse_local_links(&self.content);
+        for link in &self.local_links {
+            self.cache.add_link_hook(link);
+        }
+
+        // Stale byte ranges; caller rebuilds if search bar is open.
+        self.search_matches.clear();
+    }
+
+    fn navigate_to_link(&mut self, link: &str) -> io::Result<bool> {
         if link.starts_with('#') {
-            return;
+            return Ok(false);
         }
 
         let Some(current_dir) = self.path.parent() else {
-            return;
+            return Ok(false);
         };
 
         let path_part = link.split('#').next().unwrap_or(link);
@@ -817,12 +800,17 @@ impl Tab {
 
         let target_path = match target_path.canonicalize() {
             Ok(p) => p,
-            Err(_) => return,
+            Err(_) => return Ok(false),
         };
 
-        self.history_back.push(self.path.clone());
+        if target_path == self.path || !target_path.is_file() {
+            return Ok(false);
+        }
+        let previous_path = self.path.clone();
+        self.load_file(&target_path)?;
+        self.history_back.push(previous_path);
         self.history_forward.clear();
-        self.load_file(&target_path);
+        Ok(true)
     }
 
     fn check_link_hooks(&self) -> Option<String> {
@@ -842,18 +830,26 @@ impl Tab {
         !self.history_forward.is_empty()
     }
 
-    fn navigate_back(&mut self) {
-        if let Some(prev_path) = self.history_back.pop() {
-            self.history_forward.push(self.path.clone());
-            self.load_file(&prev_path);
-        }
+    fn navigate_back(&mut self) -> io::Result<bool> {
+        let Some(prev_path) = self.history_back.last().cloned() else {
+            return Ok(false);
+        };
+        let current_path = self.path.clone();
+        self.load_file(&prev_path)?;
+        self.history_back.pop();
+        self.history_forward.push(current_path);
+        Ok(true)
     }
 
-    fn navigate_forward(&mut self) {
-        if let Some(next_path) = self.history_forward.pop() {
-            self.history_back.push(self.path.clone());
-            self.load_file(&next_path);
-        }
+    fn navigate_forward(&mut self) -> io::Result<bool> {
+        let Some(next_path) = self.history_forward.last().cloned() else {
+            return Ok(false);
+        };
+        let current_path = self.path.clone();
+        self.load_file(&next_path)?;
+        self.history_forward.pop();
+        self.history_back.push(current_path);
+        Ok(true)
     }
 
     fn resolve_link(&self, link: &str) -> Option<PathBuf> {
@@ -1473,15 +1469,28 @@ impl MarkdownApp {
         let show_explorer = persisted.show_explorer.unwrap_or(true);
 
         // Determine initial tabs
+        let mut startup_error = None;
         let initial_tabs: Vec<Tab> = if let Some(ref path) = file {
             // CLI argument takes priority
-            vec![Tab::new(path.clone())]
+            match Tab::new(path.clone()) {
+                Ok(tab) => vec![tab],
+                Err(error) => {
+                    startup_error = Some(format!("Unable to open {}: {error}", path.display()));
+                    Vec::new()
+                }
+            }
         } else if let Some(paths) = persisted.open_tabs {
             // Restore previous session tabs
             paths
                 .into_iter()
                 .filter(|p| p.exists())
-                .map(Tab::new)
+                .filter_map(|path| match Tab::new(path.clone()) {
+                    Ok(tab) => Some(tab),
+                    Err(error) => {
+                        log::warn!("Unable to restore {}: {error}", path.display());
+                        None
+                    }
+                })
                 .collect()
         } else {
             // No file and no saved session → start empty (welcome page).
@@ -1546,7 +1555,7 @@ impl MarkdownApp {
             show_outline,
             full_width_content,
             watch_enabled: watch,
-            error_message: None,
+            error_message: startup_error,
             is_dragging: false,
             watcher: None,
             watcher_rx: None,
@@ -1635,7 +1644,6 @@ impl MarkdownApp {
     fn open_in_new_tab(&mut self, path: PathBuf) {
         // Canonicalize for consistent comparison with existing tabs
         let path = path.canonicalize().unwrap_or(path);
-        self.record_recent(&path);
         // Check if already open
         if let Some(idx) = self.tabs.iter().position(|t| t.path == path) {
             self.active_tab = idx;
@@ -1644,7 +1652,14 @@ impl MarkdownApp {
         }
 
         // Add new tab
-        let tab = Tab::new(path);
+        let tab = match Tab::new(path.clone()) {
+            Ok(tab) => tab,
+            Err(error) => {
+                self.error_message = Some(format!("Unable to open {}: {error}", path.display()));
+                return;
+            }
+        };
+        self.record_recent(&path);
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         self.title_dirty = true;
@@ -1653,6 +1668,19 @@ impl MarkdownApp {
         // Update watcher if enabled
         if self.watch_enabled {
             self.update_watched_paths();
+        }
+    }
+
+    fn navigate_active_history(&mut self, go_back: bool) {
+        let result = self.tabs.get_mut(self.active_tab).map(|tab| {
+            if go_back {
+                tab.navigate_back()
+            } else {
+                tab.navigate_forward()
+            }
+        });
+        if let Some(Err(error)) = result {
+            self.error_message = Some(format!("Unable to navigate history: {error}"));
         }
     }
 
@@ -1731,7 +1759,14 @@ impl MarkdownApp {
         }
     }
 
+    /// Start watching because of a user action or configuration change.
     fn start_watching(&mut self) {
+        self.watcher_retry_count = 0;
+        self.start_watching_attempt();
+    }
+
+    /// Construct watchers without resetting the recovery-attempt counter.
+    fn start_watching_attempt(&mut self) {
         self.stop_watching();
 
         let tab_paths = self.get_open_tab_paths();
@@ -1866,20 +1901,24 @@ impl MarkdownApp {
             // Bridge thread: forward events and wake egui on demand
             let (bridge_tx, bridge_rx) = mpsc::channel();
             let ctx = self.egui_ctx.clone();
-            std::thread::Builder::new()
+            let bridge = std::thread::Builder::new()
                 .name("watcher-bridge".into())
                 .spawn(move || {
                     while let Ok(event) = debouncer_rx.recv() {
                         let _ = bridge_tx.send(event);
                         ctx.request_repaint();
                     }
-                })
-                .expect("failed to spawn watcher bridge thread");
+                });
+
+            if let Err(error) = bridge {
+                log::error!("Failed to spawn watcher bridge thread: {error}");
+                self.error_message = Some(format!("Failed to start file watcher bridge: {error}"));
+                return;
+            }
 
             self.watcher = Some(fw);
             self.watcher_rx = Some(bridge_rx);
             self.watch_enabled = true;
-            self.watcher_retry_count = 0;
         } else {
             log::error!("Failed to create any file watcher");
             self.error_message = Some("Failed to create file watcher".to_string());
@@ -1990,15 +2029,18 @@ impl MarkdownApp {
             // Attempt recovery if watching is enabled and there's something to watch
             // Check actual tabs and explorer root, not watched_paths (which may be empty after failure)
             let has_watchable = !self.tabs.is_empty() || self.file_explorer.root.is_some();
-            if self.watch_enabled && has_watchable && self.watcher_retry_count < MAX_WATCHER_RETRIES
-            {
-                log::info!(
-                    "Attempting to recover file watcher (attempt {})",
-                    self.watcher_retry_count + 1
-                );
-                self.watcher_retry_count += 1;
-                self.start_watching();
-                self.egui_ctx.request_repaint_after(Duration::from_secs(2));
+            if self.watch_enabled && has_watchable {
+                if let Some(attempt) = next_watcher_retry(self.watcher_retry_count) {
+                    self.watcher_retry_count = attempt;
+                    log::info!("Attempting to recover file watcher (attempt {attempt})");
+                    self.start_watching_attempt();
+                    self.egui_ctx.request_repaint_after(Duration::from_secs(2));
+                } else {
+                    self.error_message = Some(format!(
+                        "File watcher failed after {MAX_WATCHER_RETRIES} retries"
+                    ));
+                    self.watch_enabled = false;
+                }
             }
             return Vec::new();
         };
@@ -2021,13 +2063,10 @@ impl MarkdownApp {
                     self.watcher = None;
                     self.watcher_rx = None;
 
-                    if self.watcher_retry_count < MAX_WATCHER_RETRIES {
-                        self.watcher_retry_count += 1;
-                        log::info!(
-                            "Attempting watcher recovery (attempt {})",
-                            self.watcher_retry_count
-                        );
-                        self.start_watching();
+                    if let Some(attempt) = next_watcher_retry(self.watcher_retry_count) {
+                        self.watcher_retry_count = attempt;
+                        log::info!("Attempting watcher recovery (attempt {attempt})");
+                        self.start_watching_attempt();
                         self.egui_ctx.request_repaint_after(Duration::from_secs(2));
                     } else {
                         self.error_message = Some(format!(
@@ -2086,7 +2125,11 @@ impl MarkdownApp {
             for tab in &mut self.tabs {
                 if tab.path == path {
                     log::info!("Reloading tab: {:?}", path);
-                    tab.reload();
+                    if let Err(error) = tab.reload() {
+                        self.error_message =
+                            Some(format!("Unable to reload {}: {error}", path.display()));
+                        continue;
+                    }
                     if Some(&tab.path) == active_path.as_ref() {
                         active_was_reloaded = true;
                     }
@@ -2804,6 +2847,7 @@ impl MarkdownApp {
 
     fn render_tab_content(&mut self, ui: &mut egui::Ui, ctrl_held: bool) -> Option<PathBuf> {
         let mut open_in_new_tab: Option<PathBuf> = None;
+        let mut navigation_error = None;
 
         // Snapshot search state before taking a mutable borrow on the active tab
         let search_is_open = self.search.is_open;
@@ -2972,8 +3016,14 @@ impl MarkdownApp {
                 }
             } else {
                 // Navigate in current tab
-                tab.navigate_to_link(&clicked_link);
+                if let Err(error) = tab.navigate_to_link(&clicked_link) {
+                    navigation_error = Some(format!("Unable to open {clicked_link}: {error}"));
+                }
             }
+        }
+
+        if let Some(error) = navigation_error {
+            self.error_message = Some(error);
         }
 
         open_in_new_tab
@@ -3918,14 +3968,10 @@ impl eframe::App for MarkdownApp {
             self.focus_tab(idx);
         }
         if go_back {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.navigate_back();
-            }
+            self.navigate_active_history(true);
         }
         if go_forward {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.navigate_forward();
-            }
+            self.navigate_active_history(false);
         }
 
         // Search bar actions (Ctrl+F open, Enter/Shift+Enter cycle, Esc close)
@@ -4056,9 +4102,7 @@ impl eframe::App for MarkdownApp {
                         .add_enabled(can_back, egui::Button::new("← Back").shortcut_text("Alt+←"))
                         .clicked()
                     {
-                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                            tab.navigate_back();
-                        }
+                        self.navigate_active_history(true);
                         ui.close();
                     }
 
@@ -4074,9 +4118,7 @@ impl eframe::App for MarkdownApp {
                         )
                         .clicked()
                     {
-                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                            tab.navigate_forward();
-                        }
+                        self.navigate_active_history(false);
                         ui.close();
                     }
                 });
@@ -4272,14 +4314,10 @@ impl eframe::App for MarkdownApp {
 
         // Handle navigation button clicks (must be after menu bar UI)
         if go_back {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.navigate_back();
-            }
+            self.navigate_active_history(true);
         }
         if go_forward {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                tab.navigate_forward();
-            }
+            self.navigate_active_history(false);
         }
 
         // Show error message if any
@@ -4709,67 +4747,40 @@ mod tests {
     }
 
     #[test]
-    fn asynchronous_explorer_result_restores_expanded_children() {
+    fn tab_history_changes_only_after_successful_loads() {
         let root = std::env::temp_dir().join(format!(
-            "md-viewer-explorer-refresh-{}-{}",
+            "md-viewer-history-safety-{}-{}",
             std::process::id(),
             now_epoch_secs()
         ));
-        let expanded = root.join("docs");
-        fs::create_dir_all(&expanded).unwrap();
-        fs::write(expanded.join("guide.md"), "# Guide").unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.md");
+        let second = root.join("second.md");
+        fs::write(&first, "# First").unwrap();
+        fs::write(&second, "# Second").unwrap();
 
-        let (tx, rx) = mpsc::channel();
-        tx.send(ExplorerScanResult {
-            root: root.clone(),
-            sort_order: SortOrder::NameAsc,
-            tree: FileExplorer::scan_directory_shallow(&root, SortOrder::NameAsc),
-        })
-        .unwrap();
-        let mut explorer = FileExplorer {
-            root: Some(root.clone()),
-            expanded_dirs: HashSet::from([expanded.clone()]),
-            pending_scan: Some(rx),
-            ..Default::default()
-        };
+        let mut tab = Tab::new(first.clone()).unwrap();
+        assert!(tab.navigate_to_link("second.md").unwrap());
+        assert_eq!(tab.path, second.canonicalize().unwrap());
+        assert!(tab.can_go_back());
 
-        assert!(explorer.poll_pending_scan());
-        assert!(explorer
-            .get_children(&expanded)
-            .is_some_and(|children| children.iter().any(|node| node.name() == "guide.md")));
+        fs::remove_file(&first).unwrap();
+        assert!(tab.navigate_back().is_err());
+        assert_eq!(tab.path, second.canonicalize().unwrap());
+        assert!(tab.can_go_back());
+        assert!(!tab.can_go_forward());
 
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn local_root_scan_runs_asynchronously_and_restores_expansion() {
-        let root = std::env::temp_dir().join(format!(
-            "md-viewer-local-explorer-scan-{}-{}",
+    fn unreadable_new_tab_returns_an_error() {
+        let missing = std::env::temp_dir().join(format!(
+            "md-viewer-missing-{}-{}.md",
             std::process::id(),
             now_epoch_secs()
         ));
-        let expanded = root.join("docs");
-        fs::create_dir_all(&expanded).unwrap();
-        fs::write(expanded.join("guide.md"), "# Guide").unwrap();
-
-        let mut explorer = FileExplorer {
-            expanded_dirs: HashSet::from([expanded.clone()]),
-            ..Default::default()
-        };
-        explorer.set_root(root.clone());
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while explorer.pending_scan.is_some() && Instant::now() < deadline {
-            explorer.poll_pending_scan();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        assert!(explorer.pending_scan.is_none());
-        assert!(explorer
-            .get_children(&expanded)
-            .is_some_and(|children| children.iter().any(|node| node.name() == "guide.md")));
-
-        fs::remove_dir_all(root).unwrap();
+        assert!(Tab::new(missing).is_err());
     }
 
     #[test]
@@ -4843,4 +4854,78 @@ mod tests {
             0.0
         );
     }
+
+    #[test]
+    fn watcher_retry_sequence_stops_at_configured_limit() {
+        assert_eq!(next_watcher_retry(0), Some(1));
+        assert_eq!(next_watcher_retry(1), Some(2));
+        assert_eq!(next_watcher_retry(2), Some(3));
+        assert_eq!(next_watcher_retry(3), None);
+        assert_eq!(next_watcher_retry(u32::MAX), None);
+    }
+    #[test]
+    fn asynchronous_explorer_result_restores_expanded_children() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-explorer-refresh-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        let expanded = root.join("docs");
+        fs::create_dir_all(&expanded).unwrap();
+        fs::write(expanded.join("guide.md"), "# Guide").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(ExplorerScanResult {
+            root: root.clone(),
+            sort_order: SortOrder::NameAsc,
+            tree: FileExplorer::scan_directory_shallow(&root, SortOrder::NameAsc),
+        })
+        .unwrap();
+        let mut explorer = FileExplorer {
+            root: Some(root.clone()),
+            expanded_dirs: HashSet::from([expanded.clone()]),
+            pending_scan: Some(rx),
+            ..Default::default()
+        };
+
+        assert!(explorer.poll_pending_scan());
+        assert!(explorer
+            .get_children(&expanded)
+            .is_some_and(|children| children.iter().any(|node| node.name() == "guide.md")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_root_scan_runs_asynchronously_and_restores_expansion() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-local-explorer-scan-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        let expanded = root.join("docs");
+        fs::create_dir_all(&expanded).unwrap();
+        fs::write(expanded.join("guide.md"), "# Guide").unwrap();
+
+        let mut explorer = FileExplorer {
+            expanded_dirs: HashSet::from([expanded.clone()]),
+            ..Default::default()
+        };
+        explorer.set_root(root.clone());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while explorer.pending_scan.is_some() && Instant::now() < deadline {
+            explorer.poll_pending_scan();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(explorer.pending_scan.is_none());
+        assert!(explorer
+            .get_children(&expanded)
+            .is_some_and(|children| children.iter().any(|node| node.name() == "guide.md")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+
 }
