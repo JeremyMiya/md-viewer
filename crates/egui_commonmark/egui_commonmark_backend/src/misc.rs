@@ -1430,6 +1430,7 @@ fn render_math_formula(
 ) -> Result<MathRendered, String> {
     // 0. Decode common HTML entities that OCR/conversion tools may leave in math
     let latex = latex
+        .replace("&#124;", "|")
         .replace("&#x26;", "&")
         .replace("&#38;", "&")
         .replace("&#x3C;", "<")
