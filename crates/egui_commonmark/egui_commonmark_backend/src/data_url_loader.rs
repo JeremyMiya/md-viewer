@@ -19,6 +19,18 @@ struct Data {
 
 type Entry = Poll<Result<Data, String>>;
 
+struct CacheEntry {
+    value: Entry,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct DataUrlCache {
+    entries: HashMap<String, CacheEntry>,
+    use_tick: u64,
+}
+
+const MAX_DATA_URL_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DATA_URL_ENCODED_BYTES: usize = 16 * 1024 * 1024;
 
 fn data_url_too_large(uri: &str) -> bool {
@@ -39,9 +51,43 @@ fn has_data_url_scheme(uri: &str) -> bool {
     })
 }
 
+fn entry_bytes(entry: &Entry) -> usize {
+    match entry {
+        Poll::Ready(Ok(file)) => file.bytes.len() + file.mime.as_ref().map_or(0, String::len),
+        Poll::Ready(Err(error)) => error.len(),
+        Poll::Pending => 0,
+    }
+}
+
+fn trim_cache(cache: &mut DataUrlCache, keep: &str) {
+    trim_cache_to(cache, keep, MAX_DATA_URL_CACHE_BYTES);
+}
+
+fn trim_cache_to(cache: &mut DataUrlCache, keep: &str, max_bytes: usize) {
+    let mut total_bytes = cache
+        .entries
+        .iter()
+        .map(|(uri, entry)| uri.len() + entry_bytes(&entry.value))
+        .sum::<usize>();
+
+    while total_bytes > max_bytes {
+        let victim = cache
+            .entries
+            .iter()
+            .filter(|(uri, entry)| uri.as_str() != keep && !entry.value.is_pending())
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(uri, entry)| (uri.clone(), uri.len() + entry_bytes(&entry.value)));
+        let Some((victim, victim_bytes)) = victim else {
+            break;
+        };
+        cache.entries.remove(&victim);
+        total_bytes = total_bytes.saturating_sub(victim_bytes);
+    }
+}
+
 #[derive(Default)]
 pub struct DataUrlLoader {
-    cache: Arc<Mutex<HashMap<String, Entry>>>,
+    cache: Arc<Mutex<DataUrlCache>>,
 }
 
 impl DataUrlLoader {
@@ -68,7 +114,11 @@ impl BytesLoader for DataUrlLoader {
         };
 
         let mut cache = self.cache.lock();
-        if let Some(entry) = cache.get(uri).cloned() {
+        cache.use_tick = cache.use_tick.wrapping_add(1);
+        let tick = cache.use_tick;
+        if let Some(entry) = cache.entries.get_mut(uri) {
+            entry.last_used = tick;
+            let entry = entry.value.clone();
             match entry {
                 Poll::Ready(Ok(file)) => Ok(BytesPoll::Ready {
                     size: None,
@@ -79,7 +129,13 @@ impl BytesLoader for DataUrlLoader {
                 Poll::Pending => Ok(BytesPoll::Pending { size: None }),
             }
         } else {
-            cache.insert(uri.to_owned(), Poll::Pending);
+            cache.entries.insert(
+                uri.to_owned(),
+                CacheEntry {
+                    value: Poll::Pending,
+                    last_used: tick,
+                },
+            );
             drop(cache);
 
             let cache = self.cache.clone();
@@ -105,10 +161,30 @@ impl BytesLoader for DataUrlLoader {
                                     }
                                 })
                                 .map_err(|e| e.to_string());
-                            cache.lock().insert(uri, Poll::Ready(result));
+                            let mut cache = cache.lock();
+                            cache.use_tick = cache.use_tick.wrapping_add(1);
+                            let tick = cache.use_tick;
+                            cache.entries.insert(
+                                uri.clone(),
+                                CacheEntry {
+                                    value: Poll::Ready(result),
+                                    last_used: tick,
+                                },
+                            );
+                            trim_cache(&mut cache, &uri);
                         }
                         Err(e) => {
-                            cache.lock().insert(uri, Poll::Ready(Err(e.to_string())));
+                            let mut cache = cache.lock();
+                            cache.use_tick = cache.use_tick.wrapping_add(1);
+                            let tick = cache.use_tick;
+                            cache.entries.insert(
+                                uri.clone(),
+                                CacheEntry {
+                                    value: Poll::Ready(Err(e.to_string())),
+                                    last_used: tick,
+                                },
+                            );
+                            trim_cache(&mut cache, &uri);
                         }
                     }
 
@@ -121,24 +197,19 @@ impl BytesLoader for DataUrlLoader {
     }
 
     fn forget(&self, uri: &str) {
-        let _ = self.cache.lock().remove(uri);
+        let _ = self.cache.lock().entries.remove(uri);
     }
 
     fn forget_all(&self) {
-        self.cache.lock().clear();
+        self.cache.lock().entries.clear();
     }
 
     fn byte_size(&self) -> usize {
         self.cache
             .lock()
-            .values()
-            .map(|entry| match entry {
-                Poll::Ready(Ok(file)) => {
-                    file.bytes.len() + file.mime.as_ref().map_or(0, |m| m.len())
-                }
-                Poll::Ready(Err(err)) => err.len(),
-                _ => 0,
-            })
+            .entries
+            .iter()
+            .map(|(uri, entry)| uri.len() + entry_bytes(&entry.value))
             .sum()
     }
 }
@@ -162,5 +233,29 @@ mod tests {
         assert!(has_data_url_scheme("\ndata\t:\n,hello"));
         assert!(!has_data_url_scheme("https://example.com"));
         assert!(!has_data_url_scheme("database:value"));
+    }
+
+    #[test]
+    fn cache_budget_includes_uri_keys_and_evicts_lru_entries() {
+        let mut cache = DataUrlCache::default();
+        for tick in 1..=5 {
+            cache.entries.insert(
+                "x".repeat(16 - tick),
+                CacheEntry {
+                    value: Poll::Ready(Err("invalid".to_owned())),
+                    last_used: tick as u64,
+                },
+            );
+        }
+
+        trim_cache_to(&mut cache, "not-present", 32);
+
+        let bytes: usize = cache
+            .entries
+            .iter()
+            .map(|(uri, entry)| uri.len() + entry_bytes(&entry.value))
+            .sum();
+        assert!(bytes <= 32);
+        assert!(!cache.entries.contains_key(&"x".repeat(15)));
     }
 }
