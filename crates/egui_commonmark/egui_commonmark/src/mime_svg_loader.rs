@@ -4,7 +4,11 @@
 //! loader currently accepts only URIs ending in `.svg`. Dynamic image URLs
 //! commonly omit that suffix while returning `image/svg+xml` correctly.
 
-use std::{collections::HashMap, mem::size_of, sync::Arc};
+use std::{
+    collections::HashMap,
+    mem::size_of,
+    sync::{Arc, OnceLock},
+};
 
 use egui::{
     load::{BytesPoll, ImageLoadResult, ImageLoader, ImagePoll, LoadError, SizeHint},
@@ -16,7 +20,7 @@ use resvg::usvg::fontdb::{Database, Family};
 
 struct MimeSvgLoader {
     cache: Mutex<SvgCache>,
-    options: resvg::usvg::Options<'static>,
+    options: OnceLock<resvg::usvg::Options<'static>>,
 }
 
 struct SvgCacheEntry {
@@ -65,19 +69,23 @@ impl MimeSvgLoader {
 
 impl Default for MimeSvgLoader {
     fn default() -> Self {
-        let options = resvg::usvg::Options::default();
-        #[cfg(feature = "svg_text")]
-        let options = {
-            let mut options = options;
-            options.fontdb_mut().load_system_fonts();
-            repair_sans_serif_family(options.fontdb_mut());
-            options
-        };
         Self {
             cache: Mutex::default(),
-            options,
+            options: OnceLock::new(),
         }
     }
+}
+
+fn svg_options() -> resvg::usvg::Options<'static> {
+    let options = resvg::usvg::Options::default();
+    #[cfg(feature = "svg_text")]
+    let options = {
+        let mut options = options;
+        options.fontdb_mut().load_system_fonts();
+        repair_sans_serif_family(options.fontdb_mut());
+        options
+    };
+    options
 }
 
 /// fontdb may map the generic sans-serif family to a font that is not installed.
@@ -170,8 +178,9 @@ impl ImageLoader for MimeSvgLoader {
         match ctx.try_load_bytes(uri)? {
             BytesPoll::Pending { size } => Ok(ImagePoll::Pending { size }),
             BytesPoll::Ready { bytes, mime, .. } if mime.as_deref().is_some_and(is_svg_mime) => {
+                let options = self.options.get_or_init(svg_options);
                 let result =
-                    egui_extras::image::load_svg_bytes_with_size(&bytes, size_hint, &self.options)
+                    egui_extras::image::load_svg_bytes_with_size(&bytes, size_hint, options)
                         .map(Arc::new);
                 if svg_result_bytes(&result) <= MAX_SVG_CACHE_BYTES {
                     let mut cache = self.cache.lock();
@@ -265,7 +274,7 @@ mod tests {
     fn forget_removes_every_cached_size_for_uri() {
         let loader = MimeSvgLoader {
             cache: Default::default(),
-            options: resvg::usvg::Options::default(),
+            options: resvg::usvg::Options::default().into(),
         };
         let image = Arc::new(ColorImage::filled([1, 1], Color32::WHITE));
 
@@ -299,6 +308,13 @@ mod tests {
             .entries
             .keys()
             .all(|(uri, _)| uri == "https://example.com/other"));
+    }
+
+    #[test]
+    fn svg_options_are_initialized_lazily() {
+        let loader = MimeSvgLoader::default();
+
+        assert!(loader.options.get().is_none());
     }
 
     #[test]
