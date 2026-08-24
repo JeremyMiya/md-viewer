@@ -51,6 +51,10 @@ const EXPLORER_DEFAULT_WIDTH: f32 = 216.0; // 200 + 16 margins
 const OUTLINE_DEFAULT_WIDTH: f32 = 208.0; // 200 + 8 margins
 const PANEL_SEPARATORS: f32 = 16.0;
 const OPTIMAL_WINDOW_HEIGHT: f32 = 750.0;
+const SIDEBAR_MIN_WIDTH: f32 = 70.0;
+const SIDEBAR_RESIZE_GRAB_RADIUS: f32 = 8.0;
+const EXPLORER_RIGHT_RESIZE_GUTTER: i8 = 12;
+const CONTENT_RIGHT_RESIZE_GUTTER: i8 = 10;
 
 // Keyboard document scroll deltas are centralized so shortcut wiring and tests
 // share the same line/page behavior.
@@ -179,8 +183,6 @@ pub fn header_position_key(normalized_title: &str, nth_with_same_text: usize) ->
 struct Header {
     level: u8,
     title: String,
-    /// Pre-computed truncated display title for outline sidebar
-    display_title: String,
     /// Pre-computed lowercase key for header position cache lookups
     normalized_title: String,
     /// Occurrence index among headers with the same `normalized_title`.
@@ -268,13 +270,11 @@ enum FileTreeNode {
     File {
         path: PathBuf,
         name: String,
-        display_name: String,
         modified: Option<std::time::SystemTime>,
     },
     Directory {
         path: PathBuf,
         name: String,
-        display_name: String,
         modified: Option<std::time::SystemTime>,
         /// None = not yet loaded, Some = loaded (may be empty)
         children: Option<Vec<FileTreeNode>>,
@@ -335,20 +335,16 @@ impl FileExplorer {
             if entry_path.is_dir() {
                 // Show all directories - let users expand what they want
                 // (Avoids O(n×m) scanning during initial directory scan)
-                let display_name = truncate_display_name(&name, 22);
                 nodes.push(FileTreeNode::Directory {
                     path: entry_path,
                     name,
-                    display_name,
                     modified,
                     children: None, // Lazy - not loaded yet
                 });
             } else if Self::is_markdown_file(&entry_path) {
-                let display_name = truncate_display_name(&name, 25);
                 nodes.push(FileTreeNode::File {
                     path: entry_path,
                     name,
-                    display_name,
                     modified,
                 });
             }
@@ -890,20 +886,6 @@ fn is_local_markdown_link(destination: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Truncate a string for display, adding "..." if it exceeds max_len.
-/// Respects char boundaries for UTF-8 safety.
-fn truncate_display_name(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        let mut end = (max_len - 3).min(s.len());
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    } else {
-        s.to_string()
-    }
-}
-
 /// Parse markdown headers from content, skipping code blocks.
 fn parse_headers(content: &str) -> ParsedHeaders {
     let re = &*HEADER_RE;
@@ -923,7 +905,6 @@ fn parse_headers(content: &str) -> ParsedHeaders {
         if let Some(caps) = re.captures(line) {
             let title = caps[2].trim().to_string();
             let normalized_title = title.to_lowercase();
-            let display_title = truncate_display_name(&title, 35);
             // Count prior headers with the same normalized title so each
             // duplicate gets a distinct composite cache key.
             let nth_with_same_text = all_headers
@@ -933,7 +914,6 @@ fn parse_headers(content: &str) -> ParsedHeaders {
             all_headers.push(Header {
                 level: caps[1].len() as u8,
                 title,
-                display_title,
                 normalized_title,
                 nth_with_same_text,
                 line_number,
@@ -1428,7 +1408,7 @@ impl MarkdownApp {
             style.scroll_animation.points_per_second = 1500.0;
 
             // Reduce resize grab radius to prevent overlap with adjacent scrollbars
-            style.interaction.resize_grab_radius_side = 2.0;
+            style.interaction.resize_grab_radius_side = SIDEBAR_RESIZE_GRAB_RADIUS;
         });
 
         // Load persisted state
@@ -2450,8 +2430,7 @@ impl MarkdownApp {
         egui::SidePanel::right("outline")
             .resizable(true)
             .default_width(200.0)
-            .min_width(120.0)
-            .max_width(400.0)
+            .width_range(SIDEBAR_MIN_WIDTH..=f32::INFINITY)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
                     left: 8,
@@ -2518,8 +2497,11 @@ impl MarkdownApp {
                 // rows from clipping into each other.
                 let row_height = ui.spacing().interact_size.y.max(20.0);
 
-                egui::ScrollArea::vertical()
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
                     .id_salt("outline")
                     .show_rows(ui, row_height, visible_indices.len(), |ui, row_range| {
                         let mut toggle_index: Option<usize> = None;
@@ -2579,8 +2561,10 @@ impl MarkdownApp {
                                     }
                                 }
 
-                                // Header title (pre-computed truncation)
-                                let response = ui.selectable_label(false, &header.display_title);
+                                let response = ui.add(
+                                    egui::Button::selectable(false, &header.title)
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                );
 
                                 // Collect header for MCP
                                 #[cfg(feature = "mcp")]
@@ -2810,7 +2794,7 @@ impl MarkdownApp {
         egui::Frame::NONE
             .inner_margin(egui::Margin {
                 left: 8,
-                right: 3,
+                right: CONTENT_RIGHT_RESIZE_GUTTER,
                 ..Default::default()
             })
             .show(ui, |ui| {
@@ -2964,12 +2948,11 @@ impl MarkdownApp {
         egui::SidePanel::left("file_explorer")
             .resizable(true)
             .default_width(200.0)
-            .min_width(150.0)
-            .max_width(300.0)
+            .width_range(SIDEBAR_MIN_WIDTH..=f32::INFINITY)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
                     left: 8,
-                    right: 8,
+                    right: EXPLORER_RIGHT_RESIZE_GUTTER,
                     top: 8,
                     bottom: 8,
                 }),
@@ -3073,7 +3056,7 @@ impl MarkdownApp {
                 let open_paths = self.open_tab_paths.clone();
 
                 // File tree inside ScrollArea
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .id_salt("file_explorer")
                     .show(ui, |ui| {
@@ -3135,12 +3118,7 @@ impl MarkdownApp {
         let indent = depth * 16;
 
         match node {
-            FileTreeNode::File {
-                path,
-                name,
-                display_name,
-                ..
-            } => {
+            FileTreeNode::File { path, name, .. } => {
                 // Calculate flash intensity for this file
                 let flash_intensity = self.get_flash_intensity(path);
                 let dark_mode = self.dark_mode;
@@ -3155,12 +3133,15 @@ impl MarkdownApp {
                     // Highlight if file is open in a tab
                     let is_open = open_paths.contains(path);
                     let text = if is_open {
-                        egui::RichText::new(display_name.as_str()).strong()
+                        egui::RichText::new(name.as_str()).strong()
                     } else {
-                        egui::RichText::new(display_name.as_str())
+                        egui::RichText::new(name.as_str())
                     };
 
-                    let response = ui.selectable_label(is_open, text);
+                    let response = ui.add(
+                        egui::Button::selectable(is_open, text)
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
                     #[cfg(feature = "mcp")]
                     {
                         let state_value = if is_open { "open" } else { "" };
@@ -3172,10 +3153,6 @@ impl MarkdownApp {
                         );
                     }
 
-                    // Show full name on hover if truncated
-                    if display_name.len() != name.len() {
-                        response.clone().on_hover_text(name);
-                    }
                     if response.clicked() {
                         action.file_to_open = Some(path.clone());
                     }
@@ -3216,12 +3193,7 @@ impl MarkdownApp {
                     ui.ctx().debug_painter().rect_filled(rect, 4.0, flash_color);
                 }
             }
-            FileTreeNode::Directory {
-                path,
-                name,
-                display_name,
-                ..
-            } => {
+            FileTreeNode::Directory { path, name, .. } => {
                 // Calculate flash intensity for this directory
                 let flash_intensity = self.get_flash_intensity(path);
                 let dark_mode = self.dark_mode;
@@ -3253,7 +3225,8 @@ impl MarkdownApp {
                     ui.label(folder_icon);
 
                     let response = ui.add(
-                        egui::Label::new(display_name.as_str())
+                        egui::Label::new(name.as_str())
+                            .extend()
                             .selectable(false)
                             .sense(egui::Sense::click()),
                     );
@@ -3266,11 +3239,6 @@ impl MarkdownApp {
                             &response,
                             Some(state_value),
                         );
-                    }
-
-                    // Show full name on hover if truncated
-                    if display_name.len() != name.len() {
-                        response.clone().on_hover_text(name);
                     }
 
                     // Click directory name to toggle expansion
