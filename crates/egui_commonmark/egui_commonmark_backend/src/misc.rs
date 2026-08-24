@@ -4,13 +4,19 @@ use egui::{RichText, TextStyle, Ui, text::LayoutJob};
 use std::collections::HashMap;
 #[cfg(feature = "math")]
 use std::collections::HashSet;
-#[cfg(any(feature = "better_syntax_highlighting", feature = "mermaid"))]
+#[cfg(any(
+    feature = "better_syntax_highlighting",
+    feature = "mermaid",
+    feature = "math"
+))]
 use std::sync::Arc;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 #[cfg(any(feature = "mermaid", feature = "math"))]
 use std::sync::mpsc;
+#[cfg(feature = "math")]
+use std::sync::Mutex as StdMutex;
 
 use crate::pulldown::ScrollableCache;
 
@@ -140,6 +146,12 @@ impl CommonMarkOptions<'_> {
 
 /// Font family name used for Markdown strong text when the app registers a bold face.
 pub const STRONG_FONT_FAMILY: &str = "MarkdownStrong";
+
+/// Stable cache key for a heading position, derived from its source byte offset.
+/// This does not depend on formatting, emoji expansion, or duplicate titles.
+pub fn header_position_key(source_start: usize) -> String {
+    format!("heading-source:{source_start}")
+}
 
 #[derive(Default, Clone)]
 pub struct Style {
@@ -388,6 +400,60 @@ mod tests {
             assert!(rendered.size.x > 0.0);
             assert!(rendered.size.y > 0.0);
         }
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn math_cache_key_includes_exact_colors() {
+        let base = math_cache_hash(
+            "x + y",
+            false,
+            egui::Color32::BLACK,
+            egui::Color32::WHITE,
+        );
+        assert_ne!(
+            base,
+            math_cache_hash(
+                "x + y",
+                false,
+                egui::Color32::DARK_GRAY,
+                egui::Color32::WHITE,
+            )
+        );
+        assert_ne!(
+            base,
+            math_cache_hash(
+                "x + y",
+                false,
+                egui::Color32::BLACK,
+                egui::Color32::LIGHT_GRAY,
+            )
+        );
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
+    fn shared_math_worker_returns_rendered_formula() {
+        let (result_tx, result_rx) = mpsc::channel();
+        assert!(
+            MATH_JOB_TX
+                .try_send(MathJob {
+                    hash: 42,
+                    latex: "x + y".to_owned(),
+                    is_inline: true,
+                    fg: egui::Color32::BLACK,
+                    bg: egui::Color32::WHITE,
+                    result_tx,
+                })
+                .is_ok(),
+            "math worker queue should accept a test job"
+        );
+
+        let result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("math worker should return a result");
+        assert_eq!(result.hash, 42);
+        assert!(result.result.is_ok());
     }
 
     #[test]
@@ -1154,6 +1220,48 @@ struct MathRendered {
     baseline_ratio: f32,
 }
 
+#[cfg(feature = "math")]
+struct MathJob {
+    hash: u64,
+    latex: String,
+    is_inline: bool,
+    fg: egui::Color32,
+    bg: egui::Color32,
+    result_tx: mpsc::Sender<MathRenderResult>,
+}
+
+/// Shared bounded worker pool. Formula compilation is CPU-heavy, so creating
+/// a fresh OS thread for every formula adds avoidable latency and memory use.
+#[cfg(feature = "math")]
+static MATH_JOB_TX: LazyLock<mpsc::SyncSender<MathJob>> = LazyLock::new(|| {
+    let (tx, rx) = mpsc::sync_channel::<MathJob>(64);
+    let rx = Arc::new(StdMutex::new(rx));
+    for worker in 0..math_concurrency() {
+        let rx = Arc::clone(&rx);
+        if std::thread::Builder::new()
+            .name(format!("markdown-math-{worker}"))
+            .spawn(move || loop {
+                let job = match rx.lock() {
+                    Ok(receiver) => match receiver.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    },
+                    Err(_) => break,
+                };
+                let result = render_math_formula(&job.latex, job.is_inline, job.fg, job.bg);
+                let _ = job.result_tx.send(MathRenderResult {
+                    hash: job.hash,
+                    result,
+                });
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+    tx
+});
+
 /// Typst preamble defining mitex helper functions needed to compile mitex output.
 /// These map mitex's custom function names to standard Typst math functions.
 #[cfg(feature = "math")]
@@ -1322,6 +1430,7 @@ fn render_math_formula(
 ) -> Result<MathRendered, String> {
     // 0. Decode common HTML entities that OCR/conversion tools may leave in math
     let latex = latex
+        .replace("&#124;", "|")
         .replace("&#x26;", "&")
         .replace("&#38;", "&")
         .replace("&#x3C;", "<")
@@ -1438,16 +1547,10 @@ pub fn render_math(
     latex: &str,
     is_inline: bool,
 ) {
-    let is_dark = ui.style().visuals.dark_mode;
     let bg = ui.visuals().panel_fill;
     let fg = ui.visuals().text_color();
 
-    // Hash content + theme for cache key
-    let mut hasher = DefaultHasher::new();
-    latex.hash(&mut hasher);
-    is_inline.hash(&mut hasher);
-    is_dark.hash(&mut hasher);
-    let hash = hasher.finish();
+    let hash = math_cache_hash(latex, is_inline, fg, bg);
 
     // Poll for completed background renders
     let mut received_any = false;
@@ -1604,6 +1707,21 @@ pub fn render_math(
 }
 
 #[cfg(feature = "math")]
+fn math_cache_hash(
+    latex: &str,
+    is_inline: bool,
+    fg: egui::Color32,
+    bg: egui::Color32,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    latex.hash(&mut hasher);
+    is_inline.hash(&mut hasher);
+    fg.hash(&mut hasher);
+    bg.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[cfg(feature = "math")]
 fn spawn_math_render(
     hash: u64,
     latex: &str,
@@ -1612,14 +1730,26 @@ fn spawn_math_render(
     bg: egui::Color32,
     cache: &mut CommonMarkCache,
 ) {
-    cache.math_rendering.insert(hash);
-    let latex = latex.to_owned();
-    let tx = cache.math_tx.clone();
-
-    std::thread::spawn(move || {
-        let result = render_math_formula(&latex, is_inline, fg, bg);
-        let _ = tx.send(MathRenderResult { hash, result });
-    });
+    let job = MathJob {
+        hash,
+        latex: latex.to_owned(),
+        is_inline,
+        fg,
+        bg,
+        result_tx: cache.math_tx.clone(),
+    };
+    match MATH_JOB_TX.try_send(job) {
+        Ok(()) => {
+            cache.math_rendering.insert(hash);
+        }
+        Err(mpsc::TrySendError::Full(_)) => {}
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            cache.math_states.insert(
+                hash,
+                MathState::Error("math renderer workers are unavailable".to_owned()),
+            );
+        }
+    }
 }
 
 #[cfg(not(feature = "better_syntax_highlighting"))]
