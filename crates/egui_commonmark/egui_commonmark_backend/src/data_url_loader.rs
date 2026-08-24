@@ -19,6 +19,26 @@ struct Data {
 
 type Entry = Poll<Result<Data, String>>;
 
+const MAX_DATA_URL_ENCODED_BYTES: usize = 16 * 1024 * 1024;
+
+fn data_url_too_large(uri: &str) -> bool {
+    uri.len() > MAX_DATA_URL_ENCODED_BYTES
+}
+
+/// Match the scheme normalization used by `data_url::DataUrl::process`
+/// without scanning the potentially large header or body.
+fn has_data_url_scheme(uri: &str) -> bool {
+    let mut bytes = uri
+        .trim_start_matches(|ch| ch <= ' ')
+        .bytes()
+        .filter(|byte| !matches!(byte, b'\t' | b'\n' | b'\r'));
+    b"data:".iter().all(|expected| {
+        bytes
+            .next()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+    })
+}
+
 #[derive(Default)]
 pub struct DataUrlLoader {
     cache: Arc<Mutex<HashMap<String, Entry>>>,
@@ -34,6 +54,15 @@ impl BytesLoader for DataUrlLoader {
     }
 
     fn load(&self, ctx: &egui::Context, uri: &str) -> BytesLoadResult {
+        if !has_data_url_scheme(uri) {
+            return Err(LoadError::NotSupported);
+        }
+        if data_url_too_large(uri) {
+            return Err(LoadError::Loading(format!(
+                "data URL exceeds the {} MiB encoded-size limit",
+                MAX_DATA_URL_ENCODED_BYTES / (1024 * 1024)
+            )));
+        }
         if data_url::DataUrl::process(uri).is_err() {
             return Err(LoadError::NotSupported);
         };
@@ -111,5 +140,27 @@ impl BytesLoader for DataUrlLoader {
                 _ => 0,
             })
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_size_limit_is_strict() {
+        assert!(!data_url_too_large(&"x".repeat(MAX_DATA_URL_ENCODED_BYTES)));
+        assert!(data_url_too_large(
+            &"x".repeat(MAX_DATA_URL_ENCODED_BYTES + 1)
+        ));
+    }
+
+    #[test]
+    fn scheme_check_matches_data_url_normalization() {
+        assert!(has_data_url_scheme("data:,hello"));
+        assert!(has_data_url_scheme("  DATA:,hello"));
+        assert!(has_data_url_scheme("\ndata\t:\n,hello"));
+        assert!(!has_data_url_scheme("https://example.com"));
+        assert!(!has_data_url_scheme("database:value"));
     }
 }
