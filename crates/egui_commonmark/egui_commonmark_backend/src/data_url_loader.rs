@@ -2,7 +2,7 @@ use egui::load::{Bytes, BytesLoadResult, BytesLoader, BytesPoll, LoadError};
 use egui::mutex::Mutex;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, LazyLock, Mutex as StdMutex};
 use std::task::Poll;
 
 pub fn install_loader(ctx: &egui::Context) {
@@ -28,6 +28,12 @@ struct CacheEntry {
 struct DataUrlCache {
     entries: HashMap<String, CacheEntry>,
     use_tick: u64,
+}
+
+struct DecodeJob {
+    cache: Arc<Mutex<DataUrlCache>>,
+    uri: String,
+    ctx: egui::Context,
 }
 
 const MAX_DATA_URL_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -85,6 +91,67 @@ fn trim_cache_to(cache: &mut DataUrlCache, keep: &str, max_bytes: usize) {
     }
 }
 
+static DECODE_JOB_TX: LazyLock<mpsc::SyncSender<DecodeJob>> = LazyLock::new(|| {
+    let (tx, rx) = mpsc::sync_channel::<DecodeJob>(4);
+    let rx = Arc::new(StdMutex::new(rx));
+    for worker in 0..2 {
+        let rx = Arc::clone(&rx);
+        if std::thread::Builder::new()
+            .name(format!("data-url-decode-{worker}"))
+            .spawn(move || loop {
+                let job = match rx.lock() {
+                    Ok(receiver) => match receiver.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    },
+                    Err(_) => break,
+                };
+                decode_job(job);
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+    tx
+});
+
+fn decode_job(job: DecodeJob) {
+    let result = data_url::DataUrl::process(&job.uri)
+        .map_err(|error| error.to_string())
+        .and_then(|url| {
+            url.decode_to_vec()
+                .map(|(decoded, _)| {
+                    let mime = url.mime_type().to_string();
+                    Data {
+                        bytes: decoded.into(),
+                        mime: (!mime.is_empty()).then_some(mime),
+                    }
+                })
+                .map_err(|error| error.to_string())
+        });
+
+    let mut cache = job.cache.lock();
+    if cache
+        .entries
+        .get(&job.uri)
+        .is_some_and(|entry| entry.value.is_pending())
+    {
+        cache.use_tick = cache.use_tick.wrapping_add(1);
+        let tick = cache.use_tick;
+        cache.entries.insert(
+            job.uri.clone(),
+            CacheEntry {
+                value: Poll::Ready(result),
+                last_used: tick,
+            },
+        );
+        trim_cache(&mut cache, &job.uri);
+    }
+    drop(cache);
+    job.ctx.request_repaint();
+}
+
 #[derive(Default)]
 pub struct DataUrlLoader {
     cache: Arc<Mutex<DataUrlCache>>,
@@ -138,59 +205,24 @@ impl BytesLoader for DataUrlLoader {
             );
             drop(cache);
 
-            let cache = self.cache.clone();
-            let uri = uri.to_owned();
-            let ctx = ctx.clone();
-
-            std::thread::Builder::new()
-                .name("DataUrlLoader".to_owned())
-                .spawn(move || {
-                    // Must unfortuntely do the process step again
-                    let url = data_url::DataUrl::process(&uri);
-                    match url {
-                        Ok(url) => {
-                            let result = url
-                                .decode_to_vec()
-                                .map(|(decoded, _)| {
-                                    let mime = url.mime_type().to_string();
-                                    let mime = if mime.is_empty() { None } else { Some(mime) };
-
-                                    Data {
-                                        bytes: decoded.into(),
-                                        mime,
-                                    }
-                                })
-                                .map_err(|e| e.to_string());
-                            let mut cache = cache.lock();
-                            cache.use_tick = cache.use_tick.wrapping_add(1);
-                            let tick = cache.use_tick;
-                            cache.entries.insert(
-                                uri.clone(),
-                                CacheEntry {
-                                    value: Poll::Ready(result),
-                                    last_used: tick,
-                                },
-                            );
-                            trim_cache(&mut cache, &uri);
-                        }
-                        Err(e) => {
-                            let mut cache = cache.lock();
-                            cache.use_tick = cache.use_tick.wrapping_add(1);
-                            let tick = cache.use_tick;
-                            cache.entries.insert(
-                                uri.clone(),
-                                CacheEntry {
-                                    value: Poll::Ready(Err(e.to_string())),
-                                    last_used: tick,
-                                },
-                            );
-                            trim_cache(&mut cache, &uri);
-                        }
-                    }
-
-                    ctx.request_repaint();
-                })
-                .expect("could not spawn thread");
+            let job = DecodeJob {
+                cache: Arc::clone(&self.cache),
+                uri: uri.to_owned(),
+                ctx: ctx.clone(),
+            };
+            match DECODE_JOB_TX.try_send(job) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    self.cache.lock().entries.remove(uri);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.cache.lock().entries.remove(uri);
+                    return Err(LoadError::Loading(
+                        "data URL decoder workers are unavailable".to_owned(),
+                    ));
+                }
+            }
 
             Ok(BytesPoll::Pending { size: None })
         }
@@ -257,5 +289,46 @@ mod tests {
             .sum();
         assert!(bytes <= 32);
         assert!(!cache.entries.contains_key(&"x".repeat(15)));
+    }
+
+    #[test]
+    fn decode_job_replaces_pending_entry() {
+        let uri = "data:text/plain;base64,aGVsbG8=".to_owned();
+        let cache = Arc::new(Mutex::new(DataUrlCache::default()));
+        cache.lock().entries.insert(
+            uri.clone(),
+            CacheEntry {
+                value: Poll::Pending,
+                last_used: 1,
+            },
+        );
+
+        decode_job(DecodeJob {
+            cache: Arc::clone(&cache),
+            uri: uri.clone(),
+            ctx: egui::Context::default(),
+        });
+
+        let cache = cache.lock();
+        let entry = cache.entries.get(&uri).expect("decoded cache entry");
+        let Poll::Ready(Ok(data)) = &entry.value else {
+            panic!("expected decoded data URL");
+        };
+        assert_eq!(data.bytes.as_ref(), b"hello");
+        assert_eq!(data.mime.as_deref(), Some("text/plain"));
+    }
+
+    #[test]
+    fn forgotten_pending_job_does_not_restore_cache_entry() {
+        let uri = "data:,hello".to_owned();
+        let cache = Arc::new(Mutex::new(DataUrlCache::default()));
+
+        decode_job(DecodeJob {
+            cache: Arc::clone(&cache),
+            uri: uri.clone(),
+            ctx: egui::Context::default(),
+        });
+
+        assert!(!cache.lock().entries.contains_key(&uri));
     }
 }
