@@ -244,6 +244,31 @@ fn cell_visual_lines(cell: &[(pulldown_cmark::Event, Range<usize>)]) -> usize {
     max_lines
 }
 
+fn table_cell_height(
+    cell: &[(pulldown_cmark::Event, Range<usize>)],
+    line_height: f32,
+    cache: &CommonMarkCache,
+    ui: &Ui,
+) -> f32 {
+    let mut height = line_height * 1.5 * cell_visual_lines(cell) as f32;
+    for (event, _) in cell {
+        if let pulldown_cmark::Event::InlineMath(_tex) = event {
+            let conservative = line_height * 2.0;
+            #[cfg(feature = "math")]
+            let formula_height = crate::cached_inline_math_height(ui, cache, _tex)
+                .map(|exact| exact + line_height * 0.5)
+                .unwrap_or(conservative);
+            #[cfg(not(feature = "math"))]
+            let formula_height = {
+                let _ = (cache, ui);
+                conservative
+            };
+            height = height.max(formula_height);
+        }
+    }
+    height
+}
+
 /// Heuristic visual-line count for an HTML-table cell (rendered as a plain
 /// `RichText` string, not as a markdown event stream). Counts explicit
 /// newlines and adds a crude wrap estimate of ~60 chars per visual line.
@@ -1184,26 +1209,18 @@ impl CommonMarkViewerInternal {
                 self.line.try_insert_end(ui);
                 return;
             }
-            // Per-line cell height; rows grow taller when cells contain multi-chunk
-            // inline-code wraps (computed below via `cell_visual_lines`).
             let cell_h = line_h * 1.5;
-            // Header is one row; its height grows if any header cell has wrapped code.
-            let header_lines = header
+            let header_h = header
                 .iter()
-                .map(|c| cell_visual_lines(c))
-                .max()
-                .unwrap_or(1);
-            let header_h = cell_h * header_lines as f32;
-            // Pre-compute per-body-row height so multi-chunk cells aren't clipped.
+                .map(|cell| table_cell_height(cell, line_h, cache, ui))
+                .fold(cell_h, f32::max);
             let body_heights: Vec<f32> = rows
                 .iter()
                 .map(|row| {
-                    let max_lines = row
+                    row
                         .iter()
-                        .map(|c| cell_visual_lines(c))
-                        .max()
-                        .unwrap_or(1);
-                    cell_h * max_lines as f32
+                        .map(|cell| table_cell_height(cell, line_h, cache, ui))
+                        .fold(cell_h, f32::max)
                 })
                 .collect();
             // Outer ScrollArea::horizontal handles the case where columns
@@ -1430,7 +1447,11 @@ impl CommonMarkViewerInternal {
                 } else {
                     #[cfg(feature = "math")]
                     {
-                        crate::render_math(ui, cache, &tex, true);
+                        if self.is_table {
+                            crate::render_math_in_table(ui, cache, &tex);
+                        } else {
+                            crate::render_math(ui, cache, &tex, true);
+                        }
                     }
                     #[cfg(not(feature = "math"))]
                     if let Some(math_fn) = options.math_fn {
@@ -2157,6 +2178,17 @@ mod tests {
             }
         }
         visible
+    }
+
+    #[test]
+    fn table_cells_reserve_extra_height_for_inline_math() {
+        egui::__run_test_ui(|ui| {
+            let cache = CommonMarkCache::default();
+            let line_height = ui.text_style_height(&egui::TextStyle::Body);
+            let cell = vec![(Event::InlineMath(r"\frac{a}{b}".into()), 0..11)];
+
+            assert!(table_cell_height(&cell, line_height, &cache, ui) >= line_height * 2.0);
+        });
     }
 
     #[test]

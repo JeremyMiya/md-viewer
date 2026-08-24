@@ -84,7 +84,9 @@ pub use egui_commonmark_backend_extended::alerts::{Alert, AlertBundle};
 pub use egui_commonmark_backend_extended::misc::{CommonMarkCache, STRONG_FONT_FAMILY};
 pub use egui_commonmark_backend_extended::typography::{Measurement, TypographyConfig};
 #[cfg(feature = "math")]
-pub use egui_commonmark_backend_extended::render_math;
+pub use egui_commonmark_backend_extended::{
+    cached_inline_math_height, render_math, render_math_in_table,
+};
 #[cfg(feature = "math")]
 pub use egui_commonmark_backend_extended::warm_math_fonts;
 
