@@ -2385,12 +2385,19 @@ impl MarkdownApp {
                 ui.add_space(4.0);
             }
 
-            // New tab button
-            let new_tab_btn = ui.button("+").on_hover_text("New Tab (Ctrl+T)");
+            // Opening a file is what creates a new tab; there is no empty-tab state.
+            let new_tab_btn = ui
+                .button("+")
+                .on_hover_text("Open File in New Tab... (Ctrl+T)");
 
-            // Collect new tab button widget data for MCP
+            // Collect the open-file action for MCP.
             #[cfg(feature = "mcp")]
-            widget_data.push(("New Tab".to_string(), "button", new_tab_btn.rect, None));
+            widget_data.push((
+                "Open File in New Tab".to_string(),
+                "button",
+                new_tab_btn.rect,
+                None,
+            ));
 
             if new_tab_btn.clicked() {
                 self.open_file_dialog();
@@ -3745,7 +3752,7 @@ impl eframe::App for MarkdownApp {
                 if i.modifiers.ctrl && i.key_pressed(egui::Key::W) {
                     close_tab = true;
                 }
-                // Ctrl+T: New tab (open file dialog)
+                // Ctrl+T: Open a file in a new tab
                 if i.modifiers.ctrl && i.key_pressed(egui::Key::T) {
                     new_tab = true;
                 }
@@ -3955,7 +3962,7 @@ impl eframe::App for MarkdownApp {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui
-                        .add(egui::Button::new("New Tab...").shortcut_text("Ctrl+T"))
+                        .add(egui::Button::new("Open File in New Tab...").shortcut_text("Ctrl+T"))
                         .clicked()
                     {
                         self.open_file_dialog();
