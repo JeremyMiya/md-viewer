@@ -100,7 +100,7 @@ A fast, lightweight markdown viewer for Linux built with Rust and egui. Designed
 
 | Shortcut | Action |
 |----------|--------|
-| Ctrl+T | New tab (open file dialog) |
+| Ctrl+T | Open file in new tab |
 | Ctrl+W | Close current tab |
 | Ctrl+Tab | Next tab |
 | Ctrl+Shift+Tab | Previous tab |
@@ -110,7 +110,7 @@ A fast, lightweight markdown viewer for Linux built with Rust and egui. Designed
 
 | Shortcut | Action |
 |----------|--------|
-| Ctrl+O | Open file dialog |
+| Ctrl+O | Open file in new tab |
 | Alt+Left | Navigate back in history |
 | Alt+Right | Navigate forward in history |
 | Click link | Navigate in current tab |
@@ -235,7 +235,7 @@ md-viewer --foreground README.md
 md-viewer README.md --no-watch
 ```
 
-Run `md-viewer` with no file to start on the welcome page, then choose Open File, Open Folder, or a recent document. In the app, use File → Open File… or Ctrl+O to open a document, and File → Open Folder… to choose the file explorer root.
+Run `md-viewer` with no file to start on the welcome page, then choose Open File, Open Folder, or a recent document. Opening a file always creates or focuses its tab; use the `+` button, File → Open File in New Tab…, Ctrl+T, or Ctrl+O. Use File → Open Folder… to choose the file explorer root.
 
 When launched from a terminal, `md-viewer` detaches by default so the shell prompt is available while the window stays open. Use `--foreground` when you want terminal logs or blocking process behavior.
 
