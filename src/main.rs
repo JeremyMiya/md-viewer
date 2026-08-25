@@ -11,7 +11,6 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -394,8 +393,6 @@ fn restored_sidebar_width(width: Option<f32>, default: f32) -> f32 {
 struct Header {
     level: u8,
     title: String,
-    /// Pre-computed truncated display title for outline sidebar.
-    display_title: String,
     /// Byte offset of the heading's Start event. The renderer records the
     /// position under the same source-stable key, independent of formatting.
     source_start: usize,
@@ -1271,20 +1268,6 @@ fn resolve_local_link_path(destination: &str, document_dir: &Path) -> Option<Pat
     })
 }
 
-/// Truncate a string for display, adding "..." if it exceeds max_len.
-/// Respects char boundaries for UTF-8 safety.
-fn truncate_display_name(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        let mut end = (max_len - 3).min(s.len());
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &s[..end])
-    } else {
-        s.to_string()
-    }
-}
-
 /// Parse headings with the same CommonMark rules used by the renderer.
 fn parse_headers(content: &str) -> ParsedHeaders {
     use pulldown_cmark::{Event, HeadingLevel, Tag, TagEnd};
@@ -1322,7 +1305,6 @@ fn parse_headers(content: &str) -> ParsedHeaders {
                     if !title.is_empty() {
                         all_headers.push(Header {
                             level,
-                            display_title: truncate_display_name(&title, 35),
                             title,
                             source_start,
                             line_number,
