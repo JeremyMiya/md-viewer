@@ -226,6 +226,79 @@ fn nested_list_does_not_panic_in_show_scrollable() {
 }
 
 #[test]
+fn deep_scroll_keeps_content_extent_and_paints_visible_text() {
+    let mut markdown = (0..80)
+        .map(|index| {
+            format!("## Section {index}\n\nParagraph {index} with enough text to render.\n\n")
+        })
+        .collect::<String>();
+    markdown.push_str("| Signal | Type | Result | Notes |\n|---|---|---|---|\n");
+    for index in 0..80 {
+        markdown.push_str(&format!(
+            "| signal_{index} | generated | {index}.123 | a long table-cell note for row {index} |\n"
+        ));
+    }
+    markdown.extend((80..400).map(|index| {
+        format!("## Section {index}\n\nParagraph {index} with enough text to render.\n\n")
+    }));
+    let ctx = Context::default();
+    let mut cache = CommonMarkCache::default();
+    let mut initial_content_height = 0.0;
+    let mut viewport_content_heights = Vec::new();
+    let mut viewport_visible_text = Vec::new();
+    let offsets = [0.05, 0.20, 0.45, 0.70, 0.90, 0.60, 0.30, 0.10];
+
+    for pass in 0..=offsets.len() {
+        ctx.begin_pass(Default::default());
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            ui.set_width(540.0);
+            ui.set_height(220.0);
+            let out = CommonMarkViewer::new().show_scrollable(
+                "deep_scroll_extent",
+                ui,
+                &mut cache,
+                &markdown,
+            );
+            if pass == 0 {
+                initial_content_height = out.content_size.y;
+            } else {
+                viewport_content_heights.push(out.content_size.y);
+            }
+            if let Some(fraction) = offsets.get(pass) {
+                let mut state = out.state;
+                state.offset.y = initial_content_height * fraction;
+                state.store(ui.ctx(), out.id);
+            }
+        });
+        let output = ctx.end_pass();
+
+        if pass > 0 {
+            let mut visible_text = 0;
+            for clipped in output.shapes {
+                let mut painted = Vec::new();
+                collect_painted_text(&clipped.shape, &mut painted);
+                visible_text += painted
+                    .iter()
+                    .filter(|text| text.rect.intersects(clipped.clip_rect))
+                    .count();
+            }
+            viewport_visible_text.push(visible_text);
+        }
+    }
+
+    for (index, content_height) in viewport_content_heights.iter().enumerate() {
+        let extent_drift = (content_height - initial_content_height).abs();
+        assert!(
+            extent_drift <= 1.0,
+            "viewport {index} changed document height by {extent_drift}px: initial={initial_content_height}, settled={content_height}"
+        );
+    }
+    for (index, visible_text) in viewport_visible_text.iter().enumerate() {
+        assert!(*visible_text > 0, "viewport {index} painted no visible text");
+    }
+}
+
+#[test]
 fn deeply_nested_list_renders() {
     let md = "\
 - L1
