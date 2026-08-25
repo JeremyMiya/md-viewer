@@ -1,465 +1,312 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use egui::{FontData, FontDefinitions, FontFamily};
 use egui_commonmark_extended::STRONG_FONT_FAMILY;
-use fontdb::{Database, Family, Query, Source, Style, Weight, ID};
+use fontique::{
+    Blob, Collection, CollectionOptions, FamilyId, FontStyle, FontWeight, GenericFamily, Script,
+    SourceCache, SourceKind,
+};
 
-struct FontSpec {
+struct ScriptFallback {
     key: &'static str,
-    families: &'static [&'static str],
+    script: [u8; 4],
     required_glyphs: &'static str,
-    primary: bool,
-    cjk_region: Option<CjkRegion>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CjkRegion {
-    SimplifiedChinese,
-    TraditionalChinese,
-    Japanese,
-    Korean,
-}
-
-struct StrongFontSpec {
-    key: &'static str,
-    matching_regular_key: &'static str,
-    required_glyphs: &'static str,
-    primary: bool,
-}
-
-const PRIMARY_SANS_FAMILIES: &[&str] = &[
-    "Noto Sans",
-    "DejaVu Sans",
-    "Liberation Sans",
-    "Ubuntu",
-    "Cantarell",
-    "Inter",
-    "Segoe UI",
-    "Arial",
-    "Helvetica Neue",
-    "Helvetica",
-];
-
-// Keep regional CJK faces separate. Pan-CJK fonts often contain all of these
-// scripts, but their glyph variants are still region-specific.
-const CJK_SC_FAMILIES: &[&str] = &[
-    "Noto Sans CJK SC",
-    "Noto Sans SC",
-    "Source Han Sans SC",
-    "Microsoft YaHei",
-    "Microsoft YaHei UI",
-    "DengXian",
-    "SimSun",
-    "NSimSun",
-    "PingFang SC",
-    "Droid Sans Fallback",
-];
-
-const CJK_TC_FAMILIES: &[&str] = &[
-    "Noto Sans CJK TC",
-    "Noto Sans TC",
-    "Noto Sans CJK HK",
-    "Noto Sans HK",
-    "Source Han Sans TC",
-    "Source Han Sans HC",
-    "Microsoft JhengHei",
-    "PingFang TC",
-    "PingFang HK",
-];
-
-const CJK_JP_FAMILIES: &[&str] = &[
-    "Noto Sans CJK JP",
-    "Noto Sans JP",
-    "Source Han Sans JP",
-    "Yu Gothic",
-    "Hiragino Sans",
-];
-
-const CJK_KR_FAMILIES: &[&str] = &[
-    "Noto Sans CJK KR",
-    "Noto Sans KR",
-    "Source Han Sans KR",
-    "Malgun Gothic",
-    "Apple SD Gothic Neo",
-];
-
-const REGULAR_FONT_SPECS: &[FontSpec] = &[
-    FontSpec {
-        key: "SystemSans",
-        families: PRIMARY_SANS_FAMILIES,
-        required_glyphs: "Aa",
-        primary: true,
-        cjk_region: None,
+// ISO 15924 identifiers and coverage samples describe scripts, not font
+// families. The platform backend remains the sole source of family choices.
+const SCRIPT_FALLBACKS: &[ScriptFallback] = &[
+    ScriptFallback {
+        key: "SystemHanFallback",
+        script: *b"Hani",
+        required_glyphs: "中文测试繁體",
     },
-    FontSpec {
-        key: "SystemCjkScSans",
-        families: CJK_SC_FAMILIES,
-        required_glyphs: "中文",
-        primary: false,
-        cjk_region: Some(CjkRegion::SimplifiedChinese),
+    ScriptFallback {
+        key: "SystemHiraganaFallback",
+        script: *b"Hira",
+        required_glyphs: "かな",
     },
-    FontSpec {
-        key: "SystemCjkTcSans",
-        families: CJK_TC_FAMILIES,
-        required_glyphs: "繁體",
-        primary: false,
-        cjk_region: Some(CjkRegion::TraditionalChinese),
+    ScriptFallback {
+        key: "SystemKatakanaFallback",
+        script: *b"Kana",
+        required_glyphs: "カナ",
     },
-    FontSpec {
-        key: "SystemCjkJpSans",
-        families: CJK_JP_FAMILIES,
-        required_glyphs: "かなカナ",
-        primary: false,
-        cjk_region: Some(CjkRegion::Japanese),
-    },
-    FontSpec {
-        key: "SystemCjkKrSans",
-        families: CJK_KR_FAMILIES,
+    ScriptFallback {
+        key: "SystemHangulFallback",
+        script: *b"Hang",
         required_glyphs: "한글",
-        primary: false,
-        cjk_region: Some(CjkRegion::Korean),
     },
-    FontSpec {
-        key: "SystemArabicSans",
-        families: &["Noto Sans Arabic"],
+    ScriptFallback {
+        key: "SystemArabicFallback",
+        script: *b"Arab",
         required_glyphs: "اب",
-        primary: false,
-        cjk_region: None,
     },
-    FontSpec {
-        key: "SystemHebrewSans",
-        families: &["Noto Sans Hebrew"],
+    ScriptFallback {
+        key: "SystemHebrewFallback",
+        script: *b"Hebr",
         required_glyphs: "אב",
-        primary: false,
-        cjk_region: None,
     },
-    FontSpec {
-        key: "SystemDevanagariSans",
-        families: &["Noto Sans Devanagari"],
-        required_glyphs: "अक",
-        primary: false,
-        cjk_region: None,
+    ScriptFallback {
+        key: "SystemDevanagariFallback",
+        script: *b"Deva",
+        required_glyphs: "नमस्तेहिन्दी",
     },
-    FontSpec {
-        key: "SystemThaiSans",
-        families: &["Noto Sans Thai"],
-        required_glyphs: "กข",
-        primary: false,
-        cjk_region: None,
-    },
-    FontSpec {
-        key: "SystemSymbols",
-        families: &["Noto Sans Symbols"],
-        required_glyphs: "→",
-        primary: false,
-        cjk_region: None,
-    },
-    FontSpec {
-        key: "SystemSymbols2",
-        families: &["Noto Sans Symbols 2", "Noto Sans Symbols2"],
-        required_glyphs: "⚠",
-        primary: false,
-        cjk_region: None,
-    },
-    FontSpec {
-        key: "SystemDejaVuSans",
-        families: &["DejaVu Sans"],
-        required_glyphs: "⚠",
-        primary: false,
-        cjk_region: None,
+    ScriptFallback {
+        key: "SystemThaiFallback",
+        script: *b"Thai",
+        required_glyphs: "สวัสดีภาษาไทย",
     },
 ];
 
-const STRONG_FONT_SPECS: &[StrongFontSpec] = &[
-    StrongFontSpec {
-        key: "SystemSansBold",
-        matching_regular_key: "SystemSans",
-        required_glyphs: "Aa",
-        primary: true,
-    },
-    StrongFontSpec {
-        key: "SystemCjkScSansBold",
-        matching_regular_key: "SystemCjkScSans",
-        required_glyphs: "中文",
-        primary: false,
-    },
-    StrongFontSpec {
-        key: "SystemCjkTcSansBold",
-        matching_regular_key: "SystemCjkTcSans",
-        required_glyphs: "繁體",
-        primary: false,
-    },
-    StrongFontSpec {
-        key: "SystemCjkJpSansBold",
-        matching_regular_key: "SystemCjkJpSans",
-        required_glyphs: "かなカナ",
-        primary: false,
-    },
-    StrongFontSpec {
-        key: "SystemCjkKrSansBold",
-        matching_regular_key: "SystemCjkKrSans",
-        required_glyphs: "한글",
-        primary: false,
-    },
+const GENERIC_FALLBACKS: &[(GenericFamily, &str, &str)] = &[
+    (GenericFamily::Math, "SystemMathFallback", "→"),
+    (GenericFamily::SansSerif, "SystemSymbolFallback", "⚠"),
 ];
 
-struct ResolvedFont {
-    id: ID,
-    data: FontData,
+#[derive(Clone)]
+struct SelectedFont {
+    blob: Blob<u8>,
+    index: u32,
+    family_id: FamilyId,
     family: String,
     source: String,
-    weight: Weight,
+    weight: FontWeight,
 }
 
-struct InstalledRegularFonts {
-    face_ids: HashSet<ID>,
-    keys: Vec<String>,
-    families_by_key: HashMap<String, String>,
-    primary_key: Option<String>,
-}
-
-fn find_font_face_with(
-    database: &Database,
-    families: &[&str],
-    weight: Weight,
-    mut supports_required_glyphs: impl FnMut(ID) -> bool,
-) -> Option<ID> {
-    for family in families {
-        let family = [Family::Name(family)];
-        let Some(id) = database.query(&Query {
-            families: &family,
-            weight,
-            style: Style::Normal,
-            ..Query::default()
-        }) else {
-            continue;
-        };
-        if supports_required_glyphs(id) {
-            return Some(id);
-        }
+impl SelectedFont {
+    fn identity(&self) -> (u64, u32) {
+        (self.blob.id(), self.index)
     }
 
-    None
+    fn data(&self) -> FontData {
+        let mut data = FontData::from_owned(self.blob.data().to_vec());
+        data.index = self.index;
+        data
+    }
 }
 
-fn font_has_glyphs(database: &Database, id: ID, required_glyphs: &str) -> bool {
-    database
-        .with_face_data(id, |bytes, face_index| {
-            ttf_parser::Face::parse(bytes, face_index)
-                .map(|face| {
-                    required_glyphs
-                        .chars()
-                        .all(|character| face.glyph_index(character).is_some())
-                })
-                .unwrap_or(false)
+struct InstalledFont {
+    key: String,
+    selected: SelectedFont,
+    required_glyphs: &'static str,
+    primary: bool,
+}
+
+fn font_has_glyphs(blob: &Blob<u8>, index: u32, required_glyphs: &str) -> bool {
+    ttf_parser::Face::parse(blob.data(), index)
+        .map(|face| {
+            required_glyphs
+                .chars()
+                .all(|c| face.glyph_index(c).is_some())
         })
         .unwrap_or(false)
 }
 
-fn find_font_face(
-    database: &Database,
-    families: &[&str],
-    weight: Weight,
-    required_glyphs: &str,
-) -> Option<ID> {
-    find_font_face_with(database, families, weight, |id| {
-        font_has_glyphs(database, id, required_glyphs)
-    })
-}
-
-fn source_description(source: &Source) -> String {
+fn source_description(source: &SourceKind) -> String {
     match source {
-        Source::Binary(_) => "<memory>".to_owned(),
-        Source::File(path) | Source::SharedFile(path, _) => path.display().to_string(),
+        SourceKind::Memory(_) => "<memory>".to_owned(),
+        SourceKind::Path(path) => path.display().to_string(),
     }
 }
 
-fn font_data_for_face(database: &Database, id: ID) -> Option<FontData> {
-    database.with_face_data(id, |bytes, face_index| {
-        let mut data = FontData::from_owned(bytes.to_vec());
-        data.index = face_index;
-        data
-    })
-}
-
-fn resolve_font(
-    database: &Database,
-    families: &[&str],
-    weight: Weight,
+fn select_from_families(
+    collection: &mut Collection,
+    source_cache: &mut SourceCache,
+    family_ids: &[FamilyId],
+    weight: FontWeight,
     required_glyphs: &str,
-) -> Option<ResolvedFont> {
-    let id = find_font_face(database, families, weight, required_glyphs)?;
-    let face = database.face(id)?;
-    let family = face
-        .families
-        .first()
-        .map(|(name, _)| name.clone())
-        .unwrap_or_else(|| face.post_script_name.clone());
-    let source = source_description(&face.source);
-    let data = font_data_for_face(database, id)?;
-
-    Some(ResolvedFont {
-        id,
-        data,
-        family,
-        source,
-        weight: face.weight,
-    })
-}
-
-fn cjk_region_priority(locale: Option<&str>) -> [CjkRegion; 4] {
-    let locale = locale.unwrap_or_default().to_ascii_lowercase();
-    let locale = locale.replace('-', "_");
-    let subtags: Vec<_> = locale
-        .split(['_', '.'])
-        .filter(|subtag| !subtag.is_empty())
-        .collect();
-    let is_chinese = subtags.first() == Some(&"zh");
-    let is_traditional_chinese = is_chinese
-        && if subtags.contains(&"hant") {
-            true
-        } else if subtags.contains(&"hans") {
-            false
-        } else {
-            subtags
-                .iter()
-                .any(|subtag| matches!(*subtag, "tw" | "hk" | "mo"))
+    require_true_bold: bool,
+) -> Option<SelectedFont> {
+    for family_id in family_ids {
+        let Some(family) = collection.family(*family_id) else {
+            continue;
         };
+        let mut candidates: Vec<_> = family
+            .fonts()
+            .iter()
+            .filter(|font| {
+                font.style() == FontStyle::Normal
+                    && (!require_true_bold || font.weight() >= FontWeight::BOLD)
+            })
+            .collect();
+        candidates.sort_by(|left, right| {
+            let left_distance = (left.weight().value() - weight.value()).abs();
+            let right_distance = (right.weight().value() - weight.value()).abs();
+            left_distance.total_cmp(&right_distance)
+        });
 
-    if is_traditional_chinese {
-        [
-            CjkRegion::TraditionalChinese,
-            CjkRegion::SimplifiedChinese,
-            CjkRegion::Japanese,
-            CjkRegion::Korean,
-        ]
-    } else if subtags.first() == Some(&"ja") {
-        [
-            CjkRegion::Japanese,
-            CjkRegion::SimplifiedChinese,
-            CjkRegion::TraditionalChinese,
-            CjkRegion::Korean,
-        ]
-    } else if subtags.first() == Some(&"ko") {
-        [
-            CjkRegion::Korean,
-            CjkRegion::SimplifiedChinese,
-            CjkRegion::TraditionalChinese,
-            CjkRegion::Japanese,
-        ]
-    } else {
-        [
-            CjkRegion::SimplifiedChinese,
-            CjkRegion::TraditionalChinese,
-            CjkRegion::Japanese,
-            CjkRegion::Korean,
-        ]
+        for font in candidates {
+            let Some(blob) = font.load(Some(source_cache)) else {
+                continue;
+            };
+            if !font_has_glyphs(&blob, font.index(), required_glyphs) {
+                continue;
+            }
+            return Some(SelectedFont {
+                blob,
+                index: font.index(),
+                family_id: *family_id,
+                family: family.name().to_owned(),
+                source: source_description(font.source().kind()),
+                weight: font.weight(),
+            });
+        }
+    }
+    None
+}
+
+fn fallback_family_ids(
+    collection: &mut Collection,
+    script: [u8; 4],
+    locale: Option<&str>,
+) -> Vec<FamilyId> {
+    let script = Script::from_bytes(script);
+    match locale {
+        Some(locale) => collection.fallback_families((script, locale)).collect(),
+        None => collection.fallback_families(script).collect(),
     }
 }
 
-fn current_locale() -> Option<String> {
-    sys_locale::get_locale()
+fn installed_fonts_cover(installed: &[InstalledFont], glyphs: &str) -> bool {
+    installed
+        .iter()
+        .any(|font| font_has_glyphs(&font.selected.blob, font.selected.index, glyphs))
 }
 
-fn ordered_regular_specs(locale: Option<&str>) -> Vec<&'static FontSpec> {
-    let mut ordered = Vec::with_capacity(REGULAR_FONT_SPECS.len());
-    ordered.extend(
-        REGULAR_FONT_SPECS
-            .iter()
-            .filter(|spec| spec.primary && spec.cjk_region.is_none()),
-    );
-    for region in cjk_region_priority(locale) {
-        ordered.extend(
-            REGULAR_FONT_SPECS
-                .iter()
-                .filter(|spec| spec.cjk_region == Some(region)),
-        );
+fn install_regular_font(
+    definitions: &mut FontDefinitions,
+    installed: &mut Vec<InstalledFont>,
+    loaded_faces: &mut HashSet<(u64, u32)>,
+    key: &'static str,
+    selected: SelectedFont,
+    required_glyphs: &'static str,
+    primary: bool,
+) {
+    if !loaded_faces.insert(selected.identity()) {
+        return;
     }
-    ordered.extend(
-        REGULAR_FONT_SPECS
-            .iter()
-            .filter(|spec| !spec.primary && spec.cjk_region.is_none()),
+    log::info!(
+        "Loaded system font {} ({}, weight {}) from {} (face index {})",
+        key,
+        selected.family,
+        selected.weight.value(),
+        selected.source,
+        selected.index
     );
-    ordered
+    definitions
+        .font_data
+        .insert(key.to_owned(), selected.data().into());
+    if let Some(family) = definitions.families.get_mut(&FontFamily::Proportional) {
+        if primary {
+            family.insert(0, key.to_owned())
+        } else {
+            family.push(key.to_owned())
+        }
+    }
+    if let Some(family) = definitions.families.get_mut(&FontFamily::Monospace) {
+        family.push(key.to_owned());
+    }
+    installed.push(InstalledFont {
+        key: key.to_owned(),
+        selected,
+        required_glyphs,
+        primary,
+    });
 }
 
 fn install_regular_fonts(
-    database: &Database,
-    fonts: &mut FontDefinitions,
+    collection: &mut Collection,
+    source_cache: &mut SourceCache,
+    definitions: &mut FontDefinitions,
     locale: Option<&str>,
-) -> InstalledRegularFonts {
+) -> Vec<InstalledFont> {
+    let mut installed = Vec::new();
     let mut loaded_faces = HashSet::new();
-    let mut loaded_keys = Vec::new();
-    let mut families_by_key = HashMap::new();
-    let mut primary_key = None;
-    let mut cjk_faces = Vec::new();
 
-    for spec in ordered_regular_specs(locale) {
-        if spec.cjk_region.is_some()
-            && cjk_faces
-                .iter()
-                .any(|id| font_has_glyphs(database, *id, spec.required_glyphs))
-        {
+    let families: Vec<_> = collection
+        .generic_families(GenericFamily::SansSerif)
+        .collect();
+    if let Some(selected) = select_from_families(
+        collection,
+        source_cache,
+        &families,
+        FontWeight::NORMAL,
+        "Aa",
+        false,
+    ) {
+        install_regular_font(
+            definitions,
+            &mut installed,
+            &mut loaded_faces,
+            "SystemSans",
+            selected,
+            "Aa",
+            true,
+        );
+    }
+
+    for spec in SCRIPT_FALLBACKS {
+        if installed_fonts_cover(&installed, spec.required_glyphs) {
             continue;
         }
-
-        let Some(resolved) = resolve_font(
-            database,
-            spec.families,
-            Weight::NORMAL,
+        let families = fallback_family_ids(collection, spec.script, locale);
+        let Some(selected) = select_from_families(
+            collection,
+            source_cache,
+            &families,
+            FontWeight::NORMAL,
             spec.required_glyphs,
+            false,
         ) else {
             continue;
         };
-        if !loaded_faces.insert(resolved.id) {
+        install_regular_font(
+            definitions,
+            &mut installed,
+            &mut loaded_faces,
+            spec.key,
+            selected,
+            spec.required_glyphs,
+            false,
+        );
+    }
+
+    for &(generic, key, glyphs) in GENERIC_FALLBACKS {
+        if installed_fonts_cover(&installed, glyphs) {
             continue;
         }
-        if spec.cjk_region.is_some() {
-            cjk_faces.push(resolved.id);
-        }
-
-        log::info!(
-            "Loaded system font fallback {} ({}) from {} (face index {})",
-            spec.key,
-            resolved.family,
-            resolved.source,
-            resolved.data.index
+        let families: Vec<_> = collection.generic_families(generic).collect();
+        let Some(selected) = select_from_families(
+            collection,
+            source_cache,
+            &families,
+            FontWeight::NORMAL,
+            glyphs,
+            false,
+        ) else {
+            continue;
+        };
+        install_regular_font(
+            definitions,
+            &mut installed,
+            &mut loaded_faces,
+            key,
+            selected,
+            glyphs,
+            false,
         );
-        fonts
-            .font_data
-            .insert(spec.key.to_owned(), resolved.data.into());
-        families_by_key.insert(spec.key.to_owned(), resolved.family);
-
-        if let Some(family) = fonts.families.get_mut(&FontFamily::Proportional) {
-            if spec.primary {
-                family.insert(0, spec.key.to_owned());
-                primary_key = Some(spec.key.to_owned());
-            } else {
-                family.push(spec.key.to_owned());
-            }
-        }
-        if let Some(family) = fonts.families.get_mut(&FontFamily::Monospace) {
-            family.push(spec.key.to_owned());
-        }
-        loaded_keys.push(spec.key.to_owned());
     }
-
-    InstalledRegularFonts {
-        face_ids: loaded_faces,
-        keys: loaded_keys,
-        families_by_key,
-        primary_key,
-    }
+    installed
 }
 
 fn push_unique(
     destination: &mut Vec<String>,
     seen: &mut HashSet<String>,
-    font_names: impl IntoIterator<Item = String>,
+    names: impl IntoIterator<Item = String>,
 ) {
-    for font_name in font_names {
-        if seen.insert(font_name.clone()) {
-            destination.push(font_name);
+    for name in names {
+        if seen.insert(name.clone()) {
+            destination.push(name)
         }
     }
 }
@@ -468,12 +315,11 @@ fn build_strong_family(
     primary_regular: Option<&str>,
     primary_bold: Option<&str>,
     default_proportional: &[String],
-    script_bold: &[String],
+    fallback_bold: &[String],
     proportional: &[String],
 ) -> Vec<String> {
     let mut family = Vec::new();
     let mut seen = HashSet::new();
-
     push_unique(
         &mut family,
         &mut seen,
@@ -484,255 +330,146 @@ fn build_strong_family(
         &mut seen,
         primary_regular.into_iter().map(str::to_owned),
     );
-    // Keep egui's bundled Latin and emoji fonts ahead of script-specific bold
-    // faces. A CJK font may also contain Latin glyphs, but should not replace
-    // the UI's normal Latin face merely because no paired system sans is available.
     push_unique(&mut family, &mut seen, default_proportional.iter().cloned());
-    push_unique(&mut family, &mut seen, script_bold.iter().cloned());
+    push_unique(&mut family, &mut seen, fallback_bold.iter().cloned());
     push_unique(&mut family, &mut seen, proportional.iter().cloned());
-
     family
 }
 
-fn is_true_bold(weight: Weight) -> bool {
-    weight >= Weight::BOLD
-}
-
-fn ordered_script_bold_fonts(
-    regular_keys: &[String],
-    bold_by_regular_key: &HashMap<String, String>,
-) -> Vec<String> {
-    regular_keys
-        .iter()
-        .filter_map(|key| bold_by_regular_key.get(key).cloned())
-        .collect()
-}
-
 fn install_strong_font_family(
-    database: &Database,
-    fonts: &mut FontDefinitions,
-    regular_fonts: &InstalledRegularFonts,
+    collection: &mut Collection,
+    source_cache: &mut SourceCache,
+    definitions: &mut FontDefinitions,
+    installed: &[InstalledFont],
     default_proportional: &[String],
-) {
-    let mut loaded_faces = regular_fonts.face_ids.clone();
+) -> usize {
+    let mut loaded_faces: HashSet<_> = installed
+        .iter()
+        .map(|font| font.selected.identity())
+        .collect();
+    let mut primary_regular = None;
     let mut primary_bold = None;
-    let mut script_bold_by_regular_key = HashMap::new();
+    let mut fallback_bold = Vec::new();
+    let mut count = 0;
 
-    for spec in STRONG_FONT_SPECS {
-        let Some(regular_family) = regular_fonts.families_by_key.get(spec.matching_regular_key)
-        else {
-            continue;
-        };
-        let matching_family = [regular_family.as_str()];
-
-        let Some(resolved) = resolve_font(
-            database,
-            &matching_family,
-            Weight::BOLD,
-            spec.required_glyphs,
+    for regular in installed {
+        if regular.primary {
+            primary_regular = Some(regular.key.clone())
+        }
+        let Some(selected) = select_from_families(
+            collection,
+            source_cache,
+            &[regular.selected.family_id],
+            FontWeight::BOLD,
+            regular.required_glyphs,
+            true,
         ) else {
             continue;
         };
-        if !is_true_bold(resolved.weight) {
-            log::debug!(
-                "Ignoring {} because the closest installed face has weight {}",
-                spec.key,
-                resolved.weight.0
-            );
+        if !loaded_faces.insert(selected.identity()) {
             continue;
         }
-        if !loaded_faces.insert(resolved.id) {
-            continue;
-        }
-
+        let key = format!("{}Bold", regular.key);
         log::info!(
-            "Loaded Markdown strong font {} ({}) from {} (face index {})",
-            spec.key,
-            resolved.family,
-            resolved.source,
-            resolved.data.index
+            "Loaded strong font {} ({}, weight {}) from {} (face index {})",
+            key,
+            selected.family,
+            selected.weight.value(),
+            selected.source,
+            selected.index
         );
-        fonts
+        definitions
             .font_data
-            .insert(spec.key.to_owned(), resolved.data.into());
-        if spec.primary {
-            primary_bold = Some(spec.key.to_owned());
+            .insert(key.clone(), selected.data().into());
+        count += 1;
+        if regular.primary {
+            primary_bold = Some(key)
         } else {
-            script_bold_by_regular_key
-                .insert(spec.matching_regular_key.to_owned(), spec.key.to_owned());
+            fallback_bold.push(key)
         }
     }
-    let script_bold = ordered_script_bold_fonts(&regular_fonts.keys, &script_bold_by_regular_key);
 
-    let proportional = fonts
+    let proportional = definitions
         .families
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    let strong_family = build_strong_family(
-        regular_fonts.primary_key.as_deref(),
+    let strong = build_strong_family(
+        primary_regular.as_deref(),
         primary_bold.as_deref(),
         default_proportional,
-        &script_bold,
+        &fallback_bold,
         &proportional,
     );
-
-    if primary_bold.is_none() {
-        if let Some(primary_family) = regular_fonts
-            .primary_key
-            .as_ref()
-            .and_then(|key| regular_fonts.families_by_key.get(key))
-        {
-            log::warn!(
-                "No true bold face found for primary system family {primary_family}; \
-                 Markdown strong Latin text will use a regular fallback."
-            );
-        } else {
-            log::debug!(
-                "No paired system sans family found; using egui defaults for Markdown strong text."
-            );
-        }
+    if primary_regular.is_some() && primary_bold.is_none() {
+        log::warn!("No true bold face found for the primary system sans; using regular fallback.");
     }
-
-    // The renderer selects this named family for strong spans. Register it even
-    // without a bold face so systems with few fonts still degrade without panic.
-    fonts
+    definitions
         .families
-        .insert(FontFamily::Name(STRONG_FONT_FAMILY.into()), strong_family);
+        .insert(FontFamily::Name(STRONG_FONT_FAMILY.into()), strong);
+    count
 }
 
-/// Load installed fonts by family metadata instead of distro-specific paths.
+/// Load fonts through platform generic-family and script/locale fallback rules.
 ///
-/// `fontdb` scans the platform's configured font directories and also reports
-/// the face index for font collections, which is copied into `egui::FontData`.
+/// Fontique delegates to fontconfig on Linux/FreeBSD, DirectWrite on Windows,
+/// CoreText on Apple platforms, and the system configuration on Android.
 pub(crate) fn setup_fonts(ctx: &egui::Context) {
-    let mut database = Database::new();
-    database.load_system_fonts();
-    log::info!("Discovered {} installed font faces", database.len());
-
-    let mut fonts = FontDefinitions::default();
-    let default_proportional = fonts
+    let started = std::time::Instant::now();
+    let mut collection = Collection::new(CollectionOptions::default());
+    let family_count = collection.family_names().count();
+    let mut source_cache = SourceCache::default();
+    let locale = sys_locale::get_locale();
+    let mut definitions = FontDefinitions::default();
+    let defaults = definitions
         .families
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    let locale = current_locale();
-    let regular_fonts = install_regular_fonts(&database, &mut fonts, locale.as_deref());
-
-    if regular_fonts.keys.is_empty() {
+    let installed = install_regular_fonts(
+        &mut collection,
+        &mut source_cache,
+        &mut definitions,
+        locale.as_deref(),
+    );
+    let bold_count = install_strong_font_family(
+        &mut collection,
+        &mut source_cache,
+        &mut definitions,
+        &installed,
+        &defaults,
+    );
+    if installed.is_empty() {
         log::warn!("No suitable system font fallbacks found; using egui defaults.");
     } else {
         log::info!(
-            "Loaded {} system font fallbacks: {}",
-            regular_fonts.keys.len(),
-            regular_fonts.keys.join(", ")
+            "Selected {} font faces from {} families for locale {:?} in {:.1} ms",
+            installed.len() + bold_count,
+            family_count,
+            locale,
+            started.elapsed().as_secs_f64() * 1000.0
         );
     }
-
-    install_strong_font_family(&database, &mut fonts, &regular_fonts, &default_proportional);
-    ctx.set_fonts(fonts);
+    ctx.set_fonts(definitions);
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use fontdb::{FaceInfo, Language, Stretch};
-
     use super::*;
 
-    fn push_face(database: &mut Database, family: &str, weight: Weight, index: u32) -> ID {
-        database.push_face_info(FaceInfo {
-            id: ID::dummy(),
-            source: Source::Binary(Arc::new(Vec::<u8>::new())),
-            index,
-            families: vec![(family.to_owned(), Language::English_UnitedStates)],
-            post_script_name: family.replace(' ', "-"),
-            style: Style::Normal,
-            weight,
-            stretch: Stretch::Normal,
-            monospaced: false,
-        })
-    }
-
     #[test]
-    fn font_family_candidates_are_prioritized() {
-        let mut database = Database::new();
-        let fallback = push_face(&mut database, "Fallback Sans", Weight::NORMAL, 0);
-        let preferred = push_face(&mut database, "Preferred Sans", Weight::NORMAL, 0);
-
-        assert_eq!(
-            find_font_face_with(
-                &database,
-                &["Preferred Sans", "Fallback Sans"],
-                Weight::NORMAL,
-                |_| true
-            ),
-            Some(preferred)
-        );
-        assert_ne!(preferred, fallback);
-    }
-
-    #[test]
-    fn bold_query_selects_the_bold_face() {
-        let mut database = Database::new();
-        push_face(&mut database, "Example Sans", Weight::NORMAL, 0);
-        let bold = push_face(&mut database, "Example Sans", Weight::BOLD, 0);
-
-        assert_eq!(
-            find_font_face_with(&database, &["Example Sans"], Weight::BOLD, |_| true),
-            Some(bold)
-        );
-    }
-
-    #[test]
-    fn font_without_required_glyphs_is_skipped() {
-        let mut database = Database::new();
-        let missing = push_face(&mut database, "Missing Glyphs", Weight::NORMAL, 0);
-        let supported = push_face(&mut database, "Supported Glyphs", Weight::NORMAL, 0);
-
-        assert_eq!(
-            find_font_face_with(
-                &database,
-                &["Missing Glyphs", "Supported Glyphs"],
-                Weight::NORMAL,
-                |id| id != missing
-            ),
-            Some(supported)
-        );
-    }
-
-    #[test]
-    fn resolved_font_preserves_collection_face_index() {
-        let mut database = Database::new();
-        let id = push_face(&mut database, "Collection Sans", Weight::NORMAL, 7);
-        let data = font_data_for_face(&database, id).expect("font data");
-
-        assert_eq!(data.index, 7);
-    }
-
-    #[test]
-    fn empty_database_keeps_egui_fallbacks_for_strong_text() {
-        let database = Database::new();
-        let mut fonts = FontDefinitions::default();
-        let default_proportional = fonts.families[&FontFamily::Proportional].clone();
-        let regular_fonts = install_regular_fonts(&database, &mut fonts, Some("en-US"));
-
-        assert!(regular_fonts.keys.is_empty());
-        install_strong_font_family(&database, &mut fonts, &regular_fonts, &default_proportional);
-
-        assert_eq!(
-            fonts.families[&FontFamily::Name(STRONG_FONT_FAMILY.into())],
-            default_proportional
-        );
-    }
-
-    #[test]
-    fn only_weight_700_or_higher_counts_as_bold() {
-        assert!(!is_true_bold(Weight::MEDIUM));
-        assert!(!is_true_bold(Weight::SEMIBOLD));
-        assert!(is_true_bold(Weight::BOLD));
-        assert!(is_true_bold(Weight::BLACK));
+    fn reported_scripts_use_full_coverage_samples() {
+        let sample = |script| {
+            SCRIPT_FALLBACKS
+                .iter()
+                .find(|fallback| fallback.script == script)
+                .unwrap()
+                .required_glyphs
+        };
+        assert_eq!(sample(*b"Deva"), "नमस्तेहिन्दी");
+        assert_eq!(sample(*b"Thai"), "สวัสดีภาษาไทย");
+        assert!(sample(*b"Hani").contains('测'));
+        assert!(sample(*b"Hani").contains('體'));
     }
 
     #[test]
@@ -740,149 +477,65 @@ mod tests {
         let strong = build_strong_family(
             None,
             None,
-            &["Ubuntu-Light".to_owned(), "NotoEmoji-Regular".to_owned()],
-            &["SystemCjkScSansBold".to_owned()],
-            &["Ubuntu-Light".to_owned(), "SystemCjkScSans".to_owned()],
+            &["DefaultLatin".into()],
+            &["HanBold".into()],
+            &["DefaultLatin".into(), "Han".into()],
         );
-
-        assert_eq!(
-            strong,
-            [
-                "Ubuntu-Light",
-                "NotoEmoji-Regular",
-                "SystemCjkScSansBold",
-                "SystemCjkScSans"
-            ]
-        );
+        assert_eq!(strong, ["DefaultLatin", "HanBold", "Han"]);
     }
 
     #[test]
-    fn matching_primary_regular_and_bold_stay_together() {
+    fn primary_regular_and_bold_stay_together() {
         let strong = build_strong_family(
             Some("SystemSans"),
             Some("SystemSansBold"),
-            &["Ubuntu-Light".to_owned()],
-            &["SystemCjkScSansBold".to_owned()],
-            &[
-                "SystemSans".to_owned(),
-                "Ubuntu-Light".to_owned(),
-                "SystemCjkScSans".to_owned(),
-            ],
+            &["DefaultLatin".into()],
+            &["HanBold".into()],
+            &["SystemSans".into(), "Han".into()],
         );
-
         assert_eq!(
             strong,
             [
                 "SystemSansBold",
                 "SystemSans",
-                "Ubuntu-Light",
-                "SystemCjkScSansBold",
-                "SystemCjkScSans"
+                "DefaultLatin",
+                "HanBold",
+                "Han"
             ]
         );
     }
 
     #[test]
-    fn cjk_specs_keep_region_specific_glyph_variants_separate() {
-        let cjk_specs: Vec<_> = REGULAR_FONT_SPECS
-            .iter()
-            .filter(|spec| spec.key.starts_with("SystemCjk"))
-            .map(|spec| (spec.key, spec.required_glyphs))
-            .collect();
-
-        assert_eq!(
-            cjk_specs,
-            [
-                ("SystemCjkScSans", "中文"),
-                ("SystemCjkTcSans", "繁體"),
-                ("SystemCjkJpSans", "かなカナ"),
-                ("SystemCjkKrSans", "한글")
-            ]
-        );
-    }
-
-    #[test]
-    fn cjk_priority_follows_the_system_locale() {
-        assert_eq!(
-            cjk_region_priority(Some("zh_TW.UTF-8"))[0],
-            CjkRegion::TraditionalChinese
-        );
-        assert_eq!(
-            cjk_region_priority(Some("zh-Hant"))[0],
-            CjkRegion::TraditionalChinese
-        );
-        assert_eq!(
-            cjk_region_priority(Some("zh-Hant-HK"))[0],
-            CjkRegion::TraditionalChinese
-        );
-        assert_eq!(
-            cjk_region_priority(Some("zh-Hans-CN"))[0],
-            CjkRegion::SimplifiedChinese
-        );
-        assert_eq!(
-            cjk_region_priority(Some("zh-Hans-TW"))[0],
-            CjkRegion::SimplifiedChinese
-        );
-        assert_eq!(
-            cjk_region_priority(Some("ja_JP.UTF-8"))[0],
-            CjkRegion::Japanese
-        );
-        assert_eq!(
-            cjk_region_priority(Some("ko_KR.UTF-8"))[0],
-            CjkRegion::Korean
-        );
-        assert_eq!(
-            cjk_region_priority(Some("C.UTF-8"))[0],
-            CjkRegion::SimplifiedChinese
-        );
-    }
-
-    #[test]
-    fn primary_system_sans_precedes_locale_specific_cjk() {
-        let ordered = ordered_regular_specs(Some("ja_JP.UTF-8"));
-        assert_eq!(ordered[0].key, "SystemSans");
-        assert_eq!(ordered[1].key, "SystemCjkJpSans");
-    }
-
-    #[test]
-    fn script_bold_order_follows_loaded_regular_order() {
-        let regular_keys = vec![
-            "SystemSans".to_owned(),
-            "SystemCjkJpSans".to_owned(),
-            "SystemCjkTcSans".to_owned(),
-        ];
-        let bold_by_regular_key = HashMap::from([
-            (
-                "SystemCjkTcSans".to_owned(),
-                "SystemCjkTcSansBold".to_owned(),
-            ),
-            (
-                "SystemCjkJpSans".to_owned(),
-                "SystemCjkJpSansBold".to_owned(),
-            ),
-        ]);
-
-        assert_eq!(
-            ordered_script_bold_fonts(&regular_keys, &bold_by_regular_key),
-            ["SystemCjkJpSansBold", "SystemCjkTcSansBold"]
-        );
-    }
-
-    #[test]
-    #[ignore = "requires an installed CJK font; run explicitly for local verification"]
-    fn installed_fonts_cover_cjk_in_regular_and_strong_text() {
+    #[ignore = "requires installed multilingual regular and bold fonts"]
+    fn installed_fonts_cover_reported_scripts() {
         let context = egui::Context::default();
         setup_fonts(&context);
         context.begin_pass(Default::default());
-
         let regular = egui::FontId::proportional(16.0);
         let strong = egui::FontId::new(16.0, FontFamily::Name(STRONG_FONT_FAMILY.into()));
-        let cjk_samples = "中文繁體かなカナ한글";
-        let regular_has_cjk = context.fonts_mut(|fonts| fonts.has_glyphs(&regular, cjk_samples));
-        let strong_has_cjk = context.fonts_mut(|fonts| fonts.has_glyphs(&strong, cjk_samples));
-
+        let samples = [
+            "中文测试繁體",
+            "かなカナ",
+            "한글",
+            "नमस्तेहिन्दी",
+            "สวัสดีภาษาไทย",
+        ];
+        let missing_regular: Vec<_> = samples
+            .iter()
+            .filter(|sample| !context.fonts_mut(|fonts| fonts.has_glyphs(&regular, sample)))
+            .collect();
+        let missing_strong: Vec<_> = samples
+            .iter()
+            .filter(|sample| !context.fonts_mut(|fonts| fonts.has_glyphs(&strong, sample)))
+            .collect();
         let _ = context.end_pass();
-        assert!(regular_has_cjk, "regular font chain is missing CJK glyphs");
-        assert!(strong_has_cjk, "strong font chain is missing CJK glyphs");
+        assert!(
+            missing_regular.is_empty(),
+            "regular chain lacks {missing_regular:?}"
+        );
+        assert!(
+            missing_strong.is_empty(),
+            "strong chain lacks {missing_strong:?}"
+        );
     }
 }
