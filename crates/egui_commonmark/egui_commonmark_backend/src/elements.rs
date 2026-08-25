@@ -82,7 +82,7 @@ pub fn bullet_point_hollow(ui: &mut Ui, row_height: f32) {
         marker_center(rect, raw),
         raw / 6.0,
         egui::Color32::TRANSPARENT,
-        egui::Stroke::new(0.6, ui.visuals().strong_text_color()),
+        egui::Stroke::new(0.6_f32, ui.visuals().strong_text_color()),
     );
 }
 
@@ -139,7 +139,13 @@ fn width_body_space(ui: &Ui) -> f32 {
 
 /// Enhanced/specialized version of egui's code blocks. This one features copy button and borders.
 /// Uses selectable Label instead of TextEdit to allow text selection across code block boundaries.
-pub fn code_block(ui: &mut Ui, text: &str, layout_job: egui::text::LayoutJob, max_width: f32, id: egui::Id) {
+pub fn code_block(
+    ui: &mut Ui,
+    text: &str,
+    layout_job: egui::text::LayoutJob,
+    _max_width: f32,
+    id: egui::Id,
+) {
     let text = text.strip_suffix('\n').unwrap_or(text);
 
     // Reserve space for background drawing
@@ -298,7 +304,7 @@ pub fn blockquote(ui: &mut Ui, accent: egui::Color32, add_contents: impl FnOnce(
                     response.rect.left_bottom().y - 5.0,
                 ),
             ],
-            egui::Stroke::new(3.0, accent),
+            egui::Stroke::new(3.0_f32, accent),
         ),
     );
 }

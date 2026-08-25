@@ -433,20 +433,22 @@ mod tests {
 
     #[cfg(feature = "math")]
     #[test]
-    fn shared_math_worker_returns_rendered_formula() {
+    fn math_worker_returns_rendered_formula() {
+        let math_job_tx = start_math_workers(1, 1);
         let (result_tx, result_rx) = mpsc::channel();
-        assert!(
-            MATH_JOB_TX
-                .try_send(MathJob {
+        assert_eq!(
+            enqueue_math_job(
+                &math_job_tx,
+                MathJob {
                     hash: 42,
                     latex: "x + y".to_owned(),
                     is_inline: true,
                     fg: egui::Color32::BLACK,
                     bg: egui::Color32::WHITE,
                     result_tx,
-                })
-                .is_ok(),
-            "math worker queue should accept a test job"
+                },
+            ),
+            MathEnqueueStatus::Queued
         );
 
         let result = result_rx
@@ -456,6 +458,34 @@ mod tests {
         assert!(result.result.is_ok());
     }
 
+    #[cfg(feature = "math")]
+    #[test]
+    fn full_math_queue_is_reported_for_retry() {
+        let (math_job_tx, _math_job_rx) = mpsc::sync_channel(1);
+        let new_job = |hash| {
+            let (result_tx, _result_rx) = mpsc::channel();
+            MathJob {
+                hash,
+                latex: "x + y".to_owned(),
+                is_inline: true,
+                fg: egui::Color32::BLACK,
+                bg: egui::Color32::WHITE,
+                result_tx,
+            }
+        };
+
+        assert_eq!(
+            enqueue_math_job(&math_job_tx, new_job(1)),
+            MathEnqueueStatus::Queued
+        );
+        assert_eq!(
+            enqueue_math_job(&math_job_tx, new_job(2)),
+            MathEnqueueStatus::Full
+        );
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
     fn cjk_text_in_math_uses_real_glyphs_when_system_fallback_exists() {
         if !MATH_FONTS
             .iter()
@@ -482,6 +512,8 @@ mod tests {
             "different CJK characters must not render as the same missing-glyph box"
         );
     }
+    #[cfg(feature = "math")]
+    #[test]
     fn inline_fraction_raster_keeps_vertical_ink_margin() {
         let bg = egui::Color32::BLACK;
         let rendered = render_math_formula(
@@ -567,7 +599,7 @@ impl Link {
         // Apply underline and hyperlink color to all sections for better visibility
         let link_color = ui.visuals().hyperlink_color;
         for section in &mut layout_job.sections {
-            section.format.underline = egui::Stroke::new(1.0, link_color);
+            section.format.underline = egui::Stroke::new(1.0_f32, link_color);
             section.format.color = link_color;
             // Remove extra line height to bring underline closer to text
             section.format.line_height = None;
@@ -632,6 +664,7 @@ impl Image {
                 .max_width(options.max_width(ui))
                 .sense(egui::Sense::click()),
         );
+        cache.observe_image_size(&self.uri, response.rect.size());
 
         if response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -836,7 +869,9 @@ impl CodeBlock {
         let hash = hasher.finish();
 
         // Poll for completed background renders
+        let mut received_any = false;
         while let Ok(result) = cache.mermaid_rx.try_recv() {
+            received_any = true;
             // Clear the rendering slot if this result is from the active thread
             if cache.mermaid_rendering == Some(result.hash) {
                 cache.mermaid_rendering = None;
@@ -860,6 +895,10 @@ impl CodeBlock {
                     cache.mermaid_states.insert(result.hash, MermaidState::Error(err));
                 }
             }
+        }
+        if received_any {
+            cache.mark_layout_changed();
+            ui.ctx().request_repaint();
         }
 
         // First encounter: insert as Rendering placeholder, spawn only if slot is free
@@ -1284,13 +1323,19 @@ struct MathJob {
     result_tx: mpsc::Sender<MathRenderResult>,
 }
 
-/// Shared bounded worker pool. Formula compilation is CPU-heavy, so creating
-/// a fresh OS thread for every formula adds avoidable latency and memory use.
 #[cfg(feature = "math")]
-static MATH_JOB_TX: LazyLock<mpsc::SyncSender<MathJob>> = LazyLock::new(|| {
-    let (tx, rx) = mpsc::sync_channel::<MathJob>(64);
+#[derive(Debug, Eq, PartialEq)]
+enum MathEnqueueStatus {
+    Queued,
+    Full,
+    Disconnected,
+}
+
+#[cfg(feature = "math")]
+fn start_math_workers(worker_count: usize, queue_capacity: usize) -> mpsc::SyncSender<MathJob> {
+    let (tx, rx) = mpsc::sync_channel::<MathJob>(queue_capacity);
     let rx = Arc::new(StdMutex::new(rx));
-    for worker in 0..math_concurrency() {
+    for worker in 0..worker_count {
         let rx = Arc::clone(&rx);
         if std::thread::Builder::new()
             .name(format!("markdown-math-{worker}"))
@@ -1314,7 +1359,22 @@ static MATH_JOB_TX: LazyLock<mpsc::SyncSender<MathJob>> = LazyLock::new(|| {
         }
     }
     tx
-});
+}
+
+#[cfg(feature = "math")]
+fn enqueue_math_job(sender: &mpsc::SyncSender<MathJob>, job: MathJob) -> MathEnqueueStatus {
+    match sender.try_send(job) {
+        Ok(()) => MathEnqueueStatus::Queued,
+        Err(mpsc::TrySendError::Full(_)) => MathEnqueueStatus::Full,
+        Err(mpsc::TrySendError::Disconnected(_)) => MathEnqueueStatus::Disconnected,
+    }
+}
+
+/// Shared bounded worker pool. Formula compilation is CPU-heavy, so creating
+/// a fresh OS thread for every formula adds avoidable latency and memory use.
+#[cfg(feature = "math")]
+static MATH_JOB_TX: LazyLock<mpsc::SyncSender<MathJob>> =
+    LazyLock::new(|| start_math_workers(math_concurrency(), 64));
 
 /// Typst preamble defining mitex helper functions needed to compile mitex output.
 /// These map mitex's custom function names to standard Typst math functions.
@@ -1718,6 +1778,7 @@ fn render_math_with_layout(
     // the next formula spawns now instead of waiting for the 100ms placeholder
     // tick — otherwise throughput is capped at slots-per-100ms, not render speed.
     if received_any {
+        cache.mark_layout_changed();
         ui.ctx().request_repaint();
     }
 
@@ -1732,7 +1793,13 @@ fn render_math_with_layout(
         && !cache.math_rendering.contains(&hash)
         && cache.math_rendering.len() < math_concurrency()
     {
-        spawn_math_render(hash, latex, is_inline, fg, bg, cache);
+        if spawn_math_render(hash, latex, is_inline, fg, bg, cache) == MathEnqueueStatus::Full {
+            // The shared queue is bounded. Retry promptly after workers have
+            // had a chance to drain it instead of silently waiting for an
+            // unrelated UI event to revisit this formula.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(16));
+        }
     }
 
     // Display based on current state
@@ -1867,7 +1934,7 @@ fn spawn_math_render(
     fg: egui::Color32,
     bg: egui::Color32,
     cache: &mut CommonMarkCache,
-) {
+) -> MathEnqueueStatus {
     let job = MathJob {
         hash,
         latex: latex.to_owned(),
@@ -1876,18 +1943,20 @@ fn spawn_math_render(
         bg,
         result_tx: cache.math_tx.clone(),
     };
-    match MATH_JOB_TX.try_send(job) {
-        Ok(()) => {
+    let status = enqueue_math_job(&MATH_JOB_TX, job);
+    match status {
+        MathEnqueueStatus::Queued => {
             cache.math_rendering.insert(hash);
         }
-        Err(mpsc::TrySendError::Full(_)) => {}
-        Err(mpsc::TrySendError::Disconnected(_)) => {
+        MathEnqueueStatus::Full => {}
+        MathEnqueueStatus::Disconnected => {
             cache.math_states.insert(
                 hash,
                 MathState::Error("math renderer workers are unavailable".to_owned()),
             );
         }
     }
+    status
 }
 
 #[cfg(not(feature = "better_syntax_highlighting"))]
@@ -2057,6 +2126,9 @@ pub struct CommonMarkCache {
     /// estimates are unreliable in image-heavy documents.
     active_search_y: Option<f32>,
 
+    /// Incremented whenever asynchronous content changes the document layout.
+    layout_revision: u64,
+
     /// Mermaid diagram render states: content hash → rendering/ready/error
     #[cfg(feature = "mermaid")]
     mermaid_states: HashMap<u64, MermaidState>,
@@ -2080,6 +2152,10 @@ pub struct CommonMarkCache {
     /// Set when a regular image is clicked (texture id + intrinsic size for lightbox).
     /// Texture lifetime is owned by egui's loader, so we only carry the id.
     clicked_image: Option<(egui::TextureId, egui::Vec2)>,
+
+    /// Last allocated size per ordinary image URI. Loader completion can
+    /// replace a placeholder with a differently sized image.
+    image_sizes: HashMap<String, egui::Vec2>,
 
     /// Hash of the diagram that currently has an active background thread.
     /// Only one diagram renders at a time so they appear top-to-bottom.
@@ -2146,6 +2222,7 @@ impl Default for CommonMarkCache {
             search_ranges: Vec::new(),
             active_search_range: None,
             active_search_y: None,
+            layout_revision: 0,
             #[cfg(feature = "mermaid")]
             mermaid_states: HashMap::new(),
             #[cfg(feature = "mermaid")]
@@ -2164,6 +2241,7 @@ impl Default for CommonMarkCache {
             #[cfg(feature = "mermaid")]
             clicked_mermaid: None,
             clicked_image: None,
+            image_sizes: HashMap::new(),
             #[cfg(feature = "mermaid")]
             mermaid_rendering: None,
             #[cfg(feature = "math")]
@@ -2400,6 +2478,23 @@ impl CommonMarkCache {
     /// at least once since the active range was set. Used for precise scroll-into-view.
     pub fn active_search_y(&self) -> Option<f32> {
         self.active_search_y
+    }
+
+    pub fn layout_revision(&self) -> u64 {
+        self.layout_revision
+    }
+
+    pub fn mark_layout_changed(&mut self) {
+        self.layout_revision = self.layout_revision.wrapping_add(1);
+    }
+
+    fn observe_image_size(&mut self, uri: &str, size: egui::Vec2) {
+        match self.image_sizes.insert(uri.to_owned(), size) {
+            Some(previous) if (previous - size).length_sq() > 0.25 => {
+                self.mark_layout_changed();
+            }
+            _ => {}
+        }
     }
 
     /// Read-only view of stored search ranges (used by the renderer).
