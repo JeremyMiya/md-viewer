@@ -728,11 +728,16 @@ impl CommonMarkViewerInternal {
             cache.set_cached_events(content_hash, owned_events);
         }
 
+        // Left edge of the scroll area's content ui. The content column's own
+        // left edge is recorded relative to this so a viewport slice can be
+        // placed at the same column (see `ContentGeometry`).
+        let scroll_area_left = ui.max_rect().left();
         let re = ui.allocate_ui_with_layout(egui::vec2(max_width, 0.0), layout, |ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             let height = ui.text_style_height(&TextStyle::Body);
             ui.set_row_height(height);
             let content_origin_y = ui.next_widget_position().y;
+            let content_origin_x = ui.max_rect().left();
 
             // Use cached events — clone the Vec reference data for iteration
             // (events are 'static so this is cheap pointer copies, not re-parsing)
@@ -822,8 +827,14 @@ impl CommonMarkViewerInternal {
 
             if let Some(source_id) = split_points_id {
                 let content_height = (ui.next_widget_position().y - content_origin_y).max(0.0);
-                scroll_cache(cache, &source_id).page_size =
-                    Some(egui::vec2(max_width, content_height));
+                let scroll_cache = scroll_cache(cache, &source_id);
+                scroll_cache.page_size = Some(egui::vec2(max_width, content_height));
+                // Capture the column this pass wrapped at, so slices reproduce
+                // it instead of deriving a different width from their own ui.
+                scroll_cache.content_geometry = Some(ContentGeometry {
+                    width: max_width,
+                    left_offset: content_origin_x - scroll_area_left,
+                });
             }
         });
 
@@ -969,9 +980,19 @@ impl CommonMarkViewerInternal {
             // this offset recovers content-relative heading/search positions.
             cache.set_scroll_offset(viewport.min.y);
             let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
-            let max_width = options.max_width(ui);
+            // Lay the slice out at the column the bootstrap pass measured.
+            // Deriving it from this ui instead yields a different available
+            // width — the bootstrap and viewport passes reserve scrollbar
+            // space differently — so the slice wrapped at a different column
+            // than the pass that produced `page_size` and `split_points`.
+            let recorded_geometry = scroll_cache(cache, &source_id).content_geometry;
+            let max_width = recorded_geometry
+                .map(|geometry| geometry.width)
+                .unwrap_or_else(|| options.max_width(ui));
+            let content_left =
+                ui.max_rect().left() + recorded_geometry.map_or(0.0, |g| g.left_offset);
 
-            let (first_event_index, first_end_y, last_end_y, events_range) = {
+            let (first_event_index, first_end_y, events_range) = {
                 let scroll_cache = scroll_cache(cache, &source_id);
 
                 // Keep one complete block of safety margin on both sides of
@@ -992,9 +1013,6 @@ impl CommonMarkViewerInternal {
                 let last_event_index = last_split
                     .map(|(index, _, _)| *index)
                     .unwrap_or(num_rows);
-                let last_end_y = last_split
-                    .map(|(_, _, end)| end.y)
-                    .unwrap_or(page_size.y);
 
                 let range_end = last_event_index.min(scroll_cache.events.len());
                 let events_range = if first_event_index < range_end {
@@ -1003,22 +1021,23 @@ impl CommonMarkViewerInternal {
                     Vec::new()
                 };
 
-                (
-                    first_event_index,
-                    first_end_position.y,
-                    last_end_y,
-                    events_range,
-                )
+                (first_event_index, first_end_position.y, events_range)
             };
 
             // Match egui's show_rows strategy: size the parent to the full
             // document, then place only the visible slice in an absolute child.
+            //
+            // The rect is zero-height on purpose, mirroring the bootstrap's
+            // `allocate_ui_with_layout(vec2(max_width, 0.0), ..)`: the child
+            // grows downward from `slice_top` with its content. Bounding it at
+            // the slice's recorded end instead made content that needed more
+            // room than the bound overflow the ui, which inflated the reported
+            // extent and let the scroll offset run past the real document.
             let content_top = ui.max_rect().top();
             let slice_top = content_top + first_end_y;
-            let slice_bottom = (content_top + last_end_y.min(page_size.y)).max(slice_top);
-            let slice_rect = egui::Rect::from_x_y_ranges(
-                ui.max_rect().left()..=ui.max_rect().left() + max_width,
-                slice_top..=slice_bottom,
+            let slice_rect = egui::Rect::from_min_size(
+                egui::pos2(content_left, slice_top),
+                egui::vec2(max_width, 0.0),
             );
 
             ui.scope_builder(
@@ -1046,7 +1065,15 @@ impl CommonMarkViewerInternal {
                             options,
                             max_width,
                         );
-                        if index == 0 {
+                        // Mirror the bootstrap pass, which clears this after
+                        // its own first event. A slice starting part-way into
+                        // the document never sees index 0, so the flag stayed
+                        // set and the slice's first block did not open its own
+                        // row — the block was placed after the leading inline
+                        // space instead, which is why a table rendered
+                        // horizontally offset from where the bootstrap
+                        // measured it.
+                        if index == first_event_index {
                             self.line.should_not_start_newline_forced = false;
                         }
                     }

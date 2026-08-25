@@ -23,6 +23,26 @@ pub struct ScrollableCache {
     pub layout_signature: u64,
     /// Renderer-owned async content revision (for example completed math or images).
     pub layout_revision: u64,
+    /// Content geometry captured by the bootstrap pass that produced
+    /// `page_size` and `split_points`: the content column's width, and its
+    /// left edge as an offset from the scroll area's `max_rect().left()`.
+    ///
+    /// Viewport slices must lay out at exactly this geometry. Recomputing it
+    /// from the slice's own `Ui` yields a different available width (the
+    /// bootstrap and viewport passes reserve scrollbar space differently), so
+    /// the slice wrapped its content at a different column than the pass that
+    /// measured `page_size` — the document extent came out wrong and blocks
+    /// such as tables rendered narrower and horizontally offset.
+    pub content_geometry: Option<ContentGeometry>,
+}
+
+/// Layout geometry of the content column, captured at bootstrap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContentGeometry {
+    /// Width the content was laid out (and wrapped) at.
+    pub width: f32,
+    /// Left edge, relative to the scroll area's `max_rect().left()`.
+    pub left_offset: f32,
 }
 
 pub type EventIteratorItem<'e> = (usize, (pulldown_cmark::Event<'e>, Range<usize>));

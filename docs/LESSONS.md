@@ -1134,3 +1134,28 @@ Do not change renderer soft-break behavior to satisfy a fixture whose syntax exp
 **Testing technique:** Inspect final-pass painted `Shape::Text` rectangles and assert strict top-to-bottom ordering. Response height alone can miss overlap. Keep one `CommonMarkCache` across render passes so tests match production cache lifetime and egui layout can settle.
 
 **Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs`, `crates/egui_commonmark/egui_commonmark/tests/wrapping.rs`, `docs/devlog/043-list-code-block-layout.md`
+
+### Viewport slices must reproduce the bootstrap's layout exactly
+**Context:** Issue reported after #96 landed on main: on a document with a long table, scrolling stopped at the end of the table, everything below it (math, CJK, code blocks) rendered blank, and the table itself sat shifted to the right.
+
+**Root cause:** three independent divergences between the bootstrap pass (which measures `page_size` and records `split_points`) and the slice pass (which paints every later frame). All three are the same mistake in different clothes — the slice deriving something for itself instead of reproducing what the measuring pass did.
+
+1. **Recomputed column.** The slice called `options.max_width(ui)` against its own `Ui`. The bootstrap and viewport passes reserve scrollbar space differently, so the slice wrapped content at a different column than the pass that measured the document.
+2. **Squeezed rect.** The slice was bounded to a fixed-height rect (`slice_top..=slice_bottom`). Content needing more room overflowed the `Ui`, which inflated the reported extent and let the scroll offset run past the real document — the "stuck with a blank page below" symptom.
+3. **Line state never reset.** The paint loop cleared `should_not_start_newline_forced` on `index == 0` only. A slice starting at event 868 never sees index 0, so the flag stayed set, the slice's first block did not open its own row, and it was placed after the leading inline space. That was the 44px horizontal shift — a two-line cause with a purely visual symptom.
+
+**Fix:** record the content column (`ContentGeometry { width, left_offset }`) in the bootstrap pass that produces `page_size`, and have slices reuse it verbatim; make the slice rect zero-height so it grows with its content exactly like the bootstrap's `allocate_ui_with_layout(vec2(max_width, 0.0), ..)`; and key the line-state reset off the slice's first event instead of event 0.
+
+**Do not "fix" this by disabling slicing.** That was tried first and does work — main shipped that way before #96 — but it costs a full paint every frame (measured 2.3 ms sliced vs 22.7 ms full on a 59 574 px document, ~10x).
+
+**This bug is not reachable from the crate's headless tests.** Five formulations were tried — a forced-bootstrap reference frame (`pending_scroll_offset` clamps the offset, so the frames compare at different scroll positions), storing `ScrollArea` state directly (does not move the offset at all in a headless pass — a test doing this silently compares two frames at the top and passes on anything), leftmost-text-on-screen (table cells are legitimately inset from the table frame, so the metric mixes content kinds), a wheel-driven table-cell column comparison, and finally the same with the `math` feature plus md-viewer's own `table_max_width`/`default_width` options. Every one passed on the visibly broken build. The slice path *is* exercised there (1 bootstrap + 14 slice frames), so the harness is not bypassing the code; the shift appears to need md-viewer's real font stack, which the crate's test build does not load. `scripts/visual-regression.sh` covers it instead — verified to exit 1 on the broken build (38 px shift detected) and 0 on the fix.
+
+**#96's own test enshrined the bug.** `deep_scroll_keeps_content_extent_and_paints_visible_text` asserted the extent stays within 1 px, which was true only because the broken code *pinned* the extent to one bootstrap measurement — the very mechanism that made the document unreachable. Both its assertions (stable extent, some text painted) remain true of content painted in the wrong column. The bound is now 32 px, loose enough for a live-laid-out slice settling a few pixels past the measurement, tight enough to catch a slice at the wrong column (which moved it by thousands).
+
+**Xvfb harness pitfalls** hit while proving this out, all of which silently produce wrong evidence:
+- `pkill -f md-viewer` does not match a binary copied to another name (`mdv-fix`, `mdv-stock`). Eleven instances accumulated across runs; **screenshots of an obscured X11 window return the overlapping window's pixels**, so captures were mixing builds. Match process *names*, and assert exactly one window exists.
+- A `pkill -f` pattern that appears in the script's own command line kills the script itself.
+- md-viewer persists scroll position, so a second run starts where the last one ended. Isolate `XDG_DATA_HOME`/`XDG_CONFIG_HOME` per run.
+- A backgrounded `Xvfb &` inherits stdout and holds the pipe open, so `script.sh | tail` hangs forever waiting for EOF. Redirect it.
+
+**Files:** `crates/egui_commonmark/egui_commonmark/src/parsers/pulldown.rs`, `crates/egui_commonmark/egui_commonmark_backend/src/pulldown.rs` (`ContentGeometry`), `crates/egui_commonmark/egui_commonmark/tests/wrapping.rs`, `crates/egui_commonmark/egui_commonmark/tests/slice_perf.rs`, `scripts/visual-regression.sh`, `docs/devlog/055-viewport-slice-layout.md`

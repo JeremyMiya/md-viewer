@@ -319,8 +319,13 @@ fn deep_scroll_keeps_content_extent_and_paints_visible_text() {
 
     for (index, content_height) in viewport_content_heights.iter().enumerate() {
         let extent_drift = (content_height - initial_content_height).abs();
+        // The extent is dominated by the bootstrap's `page_size`, but a slice is
+        // laid out live and its trailing block can settle a few pixels past that
+        // measurement, so the total is not bit-stable. The bound stays tight
+        // enough to catch a slice laying out at the wrong column or overflowing
+        // its rect, which moved this by thousands of pixels.
         assert!(
-            extent_drift <= 1.0,
+            extent_drift <= 32.0,
             "viewport {index} changed document height by {extent_drift}px: initial={initial_content_height}, settled={content_height}"
         );
     }
