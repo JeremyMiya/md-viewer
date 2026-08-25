@@ -21,18 +21,8 @@ pub struct ScrollableCache {
     /// theme is_dark). When this changes, split_points must be cleared —
     /// their y-positions are no longer valid for the new layout.
     pub layout_signature: u64,
-    /// Content height as reported by the previous frame's ScrollAreaOutput.
-    pub last_content_h: f32,
-    /// Content height captured at the most recent bootstrap. Subsequent
-    /// paints compare `last_content_h` against this value with a hysteresis
-    /// threshold: only when |last - bootstrap| exceeds the threshold do we
-    /// invalidate page_size and trigger a re-bootstrap. This avoids the
-    /// known egui artifact where `ScrollArea::show` (bootstrap path) and
-    /// `ScrollArea::show_viewport` (skip-paint path) report content_size.y
-    /// differing by ~44 px (the panel chrome offset) for the same content —
-    /// without hysteresis that oscillation crosses any bucket boundary and
-    /// keeps the renderer in a perpetual bootstrap loop.
-    pub bootstrap_content_h: f32,
+    /// Renderer-owned async content revision (for example completed math or images).
+    pub layout_revision: u64,
 }
 
 pub type EventIteratorItem<'e> = (usize, (pulldown_cmark::Event<'e>, Range<usize>));

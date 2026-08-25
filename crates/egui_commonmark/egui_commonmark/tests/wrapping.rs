@@ -57,7 +57,10 @@ fn render_geometry_with_hooks(
         ctx.begin_pass(Default::default());
         egui::CentralPanel::default().show(&ctx, |ui| {
             ui.set_width(width);
-            let response = CommonMarkViewer::new().show(ui, &mut cache, markdown);
+            let response = CommonMarkViewer::new()
+                .default_width(Some(width as usize))
+                .table_max_width(Some(width as usize))
+                .show(ui, &mut cache, markdown);
             body_rect = response.response.rect;
         });
         let output = ctx.end_pass();
@@ -145,6 +148,34 @@ fn long_inline_code_path_keeps_clickable_link_styling_after_wrapping() {
     assert_eq!(linked_text, path, "painted text: {painted:#?}");
 }
 
+#[test]
+fn long_markdown_table_text_wraps_and_expands_its_row() {
+    let prose = "WRAPPED_MARKDOWN_CELL ".repeat(18);
+    let markdown = format!(
+        "| Key | Description |\n|---|---|\n| signal | {prose} |\n\nAFTER_MARKDOWN_TABLE"
+    );
+    let (_, row_height, painted) = render_geometry(&markdown, 360.0);
+    let cell = text_rect(&painted, "WRAPPED_MARKDOWN_CELL");
+    let after = text_rect(&painted, "AFTER_MARKDOWN_TABLE");
+
+    assert!(cell.height() > row_height * 1.5, "cell did not wrap: {cell:?}");
+    assert!(cell.bottom() <= after.top(), "wrapped row clipped/overlapped: {cell:?} {after:?}");
+}
+
+#[test]
+fn long_html_table_text_wraps_and_expands_its_row() {
+    let prose = "WRAPPED_HTML_CELL ".repeat(18);
+    let markdown = format!(
+        "<table><tr><th>Key</th><th>Description</th></tr><tr><td>signal</td><td>{prose}</td></tr></table>\n\nAFTER_HTML_TABLE"
+    );
+    let (_, row_height, painted) = render_geometry(&markdown, 360.0);
+    let cell = text_rect(&painted, "WRAPPED_HTML_CELL");
+    let after = text_rect(&painted, "AFTER_HTML_TABLE");
+
+    assert!(cell.height() > row_height * 1.5, "cell did not wrap: {cell:?}");
+    assert!(cell.bottom() <= after.top(), "wrapped row clipped/overlapped: {cell:?} {after:?}");
+}
+
 // ---------------------------------------------------------------------------
 // Nested-list regression coverage (devlog/027).
 //
@@ -223,6 +254,79 @@ fn nested_list_does_not_panic_in_show_scrollable() {
         rect.height() > 0.0,
         "show_scrollable produced empty content rect: {rect:?}"
     );
+}
+
+#[test]
+fn deep_scroll_keeps_content_extent_and_paints_visible_text() {
+    let mut markdown = (0..80)
+        .map(|index| {
+            format!("## Section {index}\n\nParagraph {index} with enough text to render.\n\n")
+        })
+        .collect::<String>();
+    markdown.push_str("| Signal | Type | Result | Notes |\n|---|---|---|---|\n");
+    for index in 0..80 {
+        markdown.push_str(&format!(
+            "| signal_{index} | generated | {index}.123 | a long table-cell note for row {index} |\n"
+        ));
+    }
+    markdown.extend((80..400).map(|index| {
+        format!("## Section {index}\n\nParagraph {index} with enough text to render.\n\n")
+    }));
+    let ctx = Context::default();
+    let mut cache = CommonMarkCache::default();
+    let mut initial_content_height = 0.0;
+    let mut viewport_content_heights = Vec::new();
+    let mut viewport_visible_text = Vec::new();
+    let offsets = [0.05, 0.20, 0.45, 0.70, 0.90, 0.60, 0.30, 0.10];
+
+    for pass in 0..=offsets.len() {
+        ctx.begin_pass(Default::default());
+        egui::CentralPanel::default().show(&ctx, |ui| {
+            ui.set_width(540.0);
+            ui.set_height(220.0);
+            let out = CommonMarkViewer::new().show_scrollable(
+                "deep_scroll_extent",
+                ui,
+                &mut cache,
+                &markdown,
+            );
+            if pass == 0 {
+                initial_content_height = out.content_size.y;
+            } else {
+                viewport_content_heights.push(out.content_size.y);
+            }
+            if let Some(fraction) = offsets.get(pass) {
+                let mut state = out.state;
+                state.offset.y = initial_content_height * fraction;
+                state.store(ui.ctx(), out.id);
+            }
+        });
+        let output = ctx.end_pass();
+
+        if pass > 0 {
+            let mut visible_text = 0;
+            for clipped in output.shapes {
+                let mut painted = Vec::new();
+                collect_painted_text(&clipped.shape, &mut painted);
+                visible_text += painted
+                    .iter()
+                    .filter(|text| text.rect.intersects(clipped.clip_rect))
+                    .count();
+            }
+            viewport_visible_text.push(visible_text);
+        }
+    }
+
+    for (index, content_height) in viewport_content_heights.iter().enumerate() {
+        let extent_drift = (content_height - initial_content_height).abs();
+        assert!(
+            extent_drift <= 1.0,
+            "viewport {index} changed document height by {extent_drift}px: initial={initial_content_height}, settled={content_height}"
+        );
+    }
+    for (index, visible_text) in viewport_visible_text.iter().enumerate() {
+        assert!(*visible_text > 0, "viewport {index} painted no visible text");
+    }
 }
 
 #[test]
