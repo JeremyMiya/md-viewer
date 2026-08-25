@@ -44,22 +44,37 @@ fn svg_result_bytes(result: &Result<Arc<ColorImage>, String>) -> usize {
 }
 
 fn trim_svg_cache(cache: &mut SvgCache, max_bytes: usize) {
-    while cache
+    let mut total_bytes = cache
         .entries
         .values()
         .map(|entry| svg_result_bytes(&entry.result))
-        .sum::<usize>()
-        > max_bytes
-    {
-        let Some(victim) = cache
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(key, _)| key.clone())
-        else {
+        .sum::<usize>();
+    if total_bytes <= max_bytes {
+        return;
+    }
+
+    // Build the eviction order once. Recomputing the total and rescanning the
+    // full map for every victim made a large trim quadratic in the entry count.
+    let mut victims: Vec<_> = cache
+        .entries
+        .iter()
+        .map(|(key, entry)| {
+            (
+                key.clone(),
+                entry.last_used,
+                svg_result_bytes(&entry.result),
+            )
+        })
+        .collect();
+    victims.sort_unstable_by_key(|(_, last_used, _)| *last_used);
+
+    for (key, _, bytes) in victims {
+        if total_bytes <= max_bytes {
             break;
-        };
-        cache.entries.remove(&victim);
+        }
+        if cache.entries.remove(&key).is_some() {
+            total_bytes = total_bytes.saturating_sub(bytes);
+        }
     }
 }
 
@@ -338,5 +353,31 @@ mod tests {
         assert!(!cache
             .entries
             .contains_key(&("old".to_owned(), SizeHint::Width(10))));
+    }
+
+    #[test]
+    fn cache_limit_evicts_multiple_entries_in_lru_order() {
+        let loader = MimeSvgLoader::default();
+        let image = Arc::new(ColorImage::filled([2, 1], Color32::WHITE));
+        let mut cache = loader.cache.lock();
+        for (uri, last_used) in [("oldest", 1), ("old", 2), ("recent", 3), ("newest", 4)] {
+            cache.entries.insert(
+                (uri.to_owned(), SizeHint::Width(10)),
+                SvgCacheEntry {
+                    result: Ok(image.clone()),
+                    last_used,
+                },
+            );
+        }
+
+        trim_svg_cache(&mut cache, 16);
+
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache
+            .entries
+            .contains_key(&("recent".to_owned(), SizeHint::Width(10))));
+        assert!(cache
+            .entries
+            .contains_key(&("newest".to_owned(), SizeHint::Width(10))));
     }
 }

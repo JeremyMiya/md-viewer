@@ -137,8 +137,8 @@ fn path_from_picker_output(stdout: Vec<u8>) -> Option<PathBuf> {
     }
 }
 
-/// Use Python's standard-library Tk binding as a no-install file picker on
-/// Linux desktops where xdg-desktop-portal is not installed.
+/// Use Python's Tk binding as a fallback file picker on Linux desktops where
+/// xdg-desktop-portal is not available.
 #[cfg(target_os = "linux")]
 fn pick_file_with_tkinter(initial_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
     const SCRIPT: &str = r#"
@@ -229,9 +229,9 @@ fn pick_file(initial_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
     }
 }
 
-/// Use Python's standard-library Tk binding as a no-install folder picker on
-/// Linux desktops where xdg-desktop-portal is not installed. The initial
-/// directory is passed as a process argument, never interpolated into Python.
+/// Use Python's Tk binding as a fallback folder picker on Linux desktops where
+/// xdg-desktop-portal is not available. The initial directory is passed as a
+/// process argument, never interpolated into Python.
 #[cfg(target_os = "linux")]
 fn pick_folder_with_tkinter(initial_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
     const SCRIPT: &str = r#"
