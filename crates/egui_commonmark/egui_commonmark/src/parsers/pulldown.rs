@@ -1298,7 +1298,7 @@ impl CommonMarkViewerInternal {
             let mut table_scope_rect = ui.cursor();
             table_scope_rect.max.x = table_scope_rect.min.x + table_bound;
             table_scope_rect.max.y = ui.max_rect().bottom();
-            let scroll_out = ui
+            let _ = ui
                 .scope_builder(egui::UiBuilder::new().max_rect(table_scope_rect), |ui| {
                     let mut scroll_out = egui::ScrollArea::horizontal()
                         .id_salt(id.with("_scroll"))
@@ -1908,7 +1908,7 @@ impl CommonMarkViewerInternal {
                         egui::vec2(available.width() + (available.left() - left_edge), available.height()),
                     );
                     let rich_texts = std::mem::take(&mut self.current_heading_rich_texts);
-                    ui.allocate_ui_at_rect(heading_rect, |ui| {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(heading_rect), |ui| {
                         for rt in rich_texts {
                             ui.label(rt);
                         }
@@ -2130,7 +2130,7 @@ impl CommonMarkViewerInternal {
         let mut table_scope_rect = ui.cursor();
         table_scope_rect.max.x = table_scope_rect.min.x + table_bound;
         table_scope_rect.max.y = ui.max_rect().bottom();
-        let scroll_out = ui
+        let _ = ui
             .scope_builder(egui::UiBuilder::new().max_rect(table_scope_rect), |ui| {
                 let mut scroll_out = egui::ScrollArea::horizontal()
                     .id_salt(id.with("_scroll"))

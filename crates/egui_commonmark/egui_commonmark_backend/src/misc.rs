@@ -567,7 +567,7 @@ impl Link {
         // Apply underline and hyperlink color to all sections for better visibility
         let link_color = ui.visuals().hyperlink_color;
         for section in &mut layout_job.sections {
-            section.format.underline = egui::Stroke::new(1.0, link_color);
+            section.format.underline = egui::Stroke::new(1.0_f32, link_color);
             section.format.color = link_color;
             // Remove extra line height to bring underline closer to text
             section.format.line_height = None;
