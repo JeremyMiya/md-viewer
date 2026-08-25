@@ -26,13 +26,13 @@ struct CacheEntry {
 
 #[derive(Default)]
 struct DataUrlCache {
-    entries: HashMap<String, CacheEntry>,
+    entries: HashMap<Arc<str>, CacheEntry>,
     use_tick: u64,
 }
 
 struct DecodeJob {
     cache: Arc<Mutex<DataUrlCache>>,
-    uri: String,
+    uri: Arc<str>,
     ctx: egui::Context,
 }
 
@@ -80,7 +80,7 @@ fn trim_cache_to(cache: &mut DataUrlCache, keep: &str, max_bytes: usize) {
         let victim = cache
             .entries
             .iter()
-            .filter(|(uri, entry)| uri.as_str() != keep && !entry.value.is_pending())
+            .filter(|(uri, entry)| uri.as_ref() != keep && !entry.value.is_pending())
             .min_by_key(|(_, entry)| entry.last_used)
             .map(|(uri, entry)| (uri.clone(), uri.len() + entry_bytes(&entry.value)));
         let Some((victim, victim_bytes)) = victim else {
@@ -117,7 +117,7 @@ static DECODE_JOB_TX: LazyLock<mpsc::SyncSender<DecodeJob>> = LazyLock::new(|| {
 });
 
 fn decode_job(job: DecodeJob) {
-    let result = data_url::DataUrl::process(&job.uri)
+    let result = data_url::DataUrl::process(job.uri.as_ref())
         .map_err(|error| error.to_string())
         .and_then(|url| {
             url.decode_to_vec()
@@ -134,19 +134,19 @@ fn decode_job(job: DecodeJob) {
     let mut cache = job.cache.lock();
     if cache
         .entries
-        .get(&job.uri)
+        .get(job.uri.as_ref())
         .is_some_and(|entry| entry.value.is_pending())
     {
         cache.use_tick = cache.use_tick.wrapping_add(1);
         let tick = cache.use_tick;
         cache.entries.insert(
-            job.uri.clone(),
+            Arc::clone(&job.uri),
             CacheEntry {
                 value: Poll::Ready(result),
                 last_used: tick,
             },
         );
-        trim_cache(&mut cache, &job.uri);
+        trim_cache(&mut cache, job.uri.as_ref());
     }
     drop(cache);
     job.ctx.request_repaint();
@@ -196,8 +196,11 @@ impl BytesLoader for DataUrlLoader {
                 Poll::Pending => Ok(BytesPoll::Pending { size: None }),
             }
         } else {
+            // The encoded URI can be up to 16 MiB. Share one allocation
+            // between the pending cache entry and the queued decode job.
+            let shared_uri: Arc<str> = Arc::from(uri);
             cache.entries.insert(
-                uri.to_owned(),
+                Arc::clone(&shared_uri),
                 CacheEntry {
                     value: Poll::Pending,
                     last_used: tick,
@@ -207,7 +210,7 @@ impl BytesLoader for DataUrlLoader {
 
             let job = DecodeJob {
                 cache: Arc::clone(&self.cache),
-                uri: uri.to_owned(),
+                uri: shared_uri,
                 ctx: ctx.clone(),
             };
             match DECODE_JOB_TX.try_send(job) {
@@ -272,7 +275,7 @@ mod tests {
         let mut cache = DataUrlCache::default();
         for tick in 1..=5 {
             cache.entries.insert(
-                "x".repeat(16 - tick),
+                Arc::from("x".repeat(16 - tick)),
                 CacheEntry {
                     value: Poll::Ready(Err("invalid".to_owned())),
                     last_used: tick as u64,
@@ -288,12 +291,12 @@ mod tests {
             .map(|(uri, entry)| uri.len() + entry_bytes(&entry.value))
             .sum();
         assert!(bytes <= 32);
-        assert!(!cache.entries.contains_key(&"x".repeat(15)));
+        assert!(!cache.entries.contains_key("x".repeat(15).as_str()));
     }
 
     #[test]
     fn decode_job_replaces_pending_entry() {
-        let uri = "data:text/plain;base64,aGVsbG8=".to_owned();
+        let uri: Arc<str> = Arc::from("data:text/plain;base64,aGVsbG8=");
         let cache = Arc::new(Mutex::new(DataUrlCache::default()));
         cache.lock().entries.insert(
             uri.clone(),
@@ -319,8 +322,27 @@ mod tests {
     }
 
     #[test]
+    fn pending_cache_and_decode_job_can_share_the_uri_allocation() {
+        let uri: Arc<str> = Arc::from("data:,hello");
+        let cache = Arc::new(Mutex::new(DataUrlCache::default()));
+        cache.lock().entries.insert(Arc::clone(&uri), CacheEntry {
+            value: Poll::Pending,
+            last_used: 1,
+        });
+        let job = DecodeJob {
+            cache: Arc::clone(&cache),
+            uri,
+            ctx: egui::Context::default(),
+        };
+
+        let cache = cache.lock();
+        let cached_uri = cache.entries.keys().next().expect("pending URI");
+        assert!(Arc::ptr_eq(cached_uri, &job.uri));
+    }
+
+    #[test]
     fn forgotten_pending_job_does_not_restore_cache_entry() {
-        let uri = "data:,hello".to_owned();
+        let uri: Arc<str> = Arc::from("data:,hello");
         let cache = Arc::new(Mutex::new(DataUrlCache::default()));
 
         decode_job(DecodeJob {

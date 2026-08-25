@@ -664,6 +664,7 @@ impl Image {
                 .max_width(options.max_width(ui))
                 .sense(egui::Sense::click()),
         );
+        cache.observe_image_size(&self.uri, response.rect.size());
 
         if response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -868,7 +869,9 @@ impl CodeBlock {
         let hash = hasher.finish();
 
         // Poll for completed background renders
+        let mut received_any = false;
         while let Ok(result) = cache.mermaid_rx.try_recv() {
+            received_any = true;
             // Clear the rendering slot if this result is from the active thread
             if cache.mermaid_rendering == Some(result.hash) {
                 cache.mermaid_rendering = None;
@@ -892,6 +895,10 @@ impl CodeBlock {
                     cache.mermaid_states.insert(result.hash, MermaidState::Error(err));
                 }
             }
+        }
+        if received_any {
+            cache.mark_layout_changed();
+            ui.ctx().request_repaint();
         }
 
         // First encounter: insert as Rendering placeholder, spawn only if slot is free
@@ -1771,6 +1778,7 @@ fn render_math_with_layout(
     // the next formula spawns now instead of waiting for the 100ms placeholder
     // tick — otherwise throughput is capped at slots-per-100ms, not render speed.
     if received_any {
+        cache.mark_layout_changed();
         ui.ctx().request_repaint();
     }
 
@@ -2118,6 +2126,9 @@ pub struct CommonMarkCache {
     /// estimates are unreliable in image-heavy documents.
     active_search_y: Option<f32>,
 
+    /// Incremented whenever asynchronous content changes the document layout.
+    layout_revision: u64,
+
     /// Mermaid diagram render states: content hash → rendering/ready/error
     #[cfg(feature = "mermaid")]
     mermaid_states: HashMap<u64, MermaidState>,
@@ -2141,6 +2152,10 @@ pub struct CommonMarkCache {
     /// Set when a regular image is clicked (texture id + intrinsic size for lightbox).
     /// Texture lifetime is owned by egui's loader, so we only carry the id.
     clicked_image: Option<(egui::TextureId, egui::Vec2)>,
+
+    /// Last allocated size per ordinary image URI. Loader completion can
+    /// replace a placeholder with a differently sized image.
+    image_sizes: HashMap<String, egui::Vec2>,
 
     /// Hash of the diagram that currently has an active background thread.
     /// Only one diagram renders at a time so they appear top-to-bottom.
@@ -2207,6 +2222,7 @@ impl Default for CommonMarkCache {
             search_ranges: Vec::new(),
             active_search_range: None,
             active_search_y: None,
+            layout_revision: 0,
             #[cfg(feature = "mermaid")]
             mermaid_states: HashMap::new(),
             #[cfg(feature = "mermaid")]
@@ -2225,6 +2241,7 @@ impl Default for CommonMarkCache {
             #[cfg(feature = "mermaid")]
             clicked_mermaid: None,
             clicked_image: None,
+            image_sizes: HashMap::new(),
             #[cfg(feature = "mermaid")]
             mermaid_rendering: None,
             #[cfg(feature = "math")]
@@ -2461,6 +2478,23 @@ impl CommonMarkCache {
     /// at least once since the active range was set. Used for precise scroll-into-view.
     pub fn active_search_y(&self) -> Option<f32> {
         self.active_search_y
+    }
+
+    pub fn layout_revision(&self) -> u64 {
+        self.layout_revision
+    }
+
+    pub fn mark_layout_changed(&mut self) {
+        self.layout_revision = self.layout_revision.wrapping_add(1);
+    }
+
+    fn observe_image_size(&mut self, uri: &str, size: egui::Vec2) {
+        match self.image_sizes.insert(uri.to_owned(), size) {
+            Some(previous) if (previous - size).length_sq() > 0.25 => {
+                self.mark_layout_changed();
+            }
+            _ => {}
+        }
     }
 
     /// Read-only view of stored search ranges (used by the renderer).
