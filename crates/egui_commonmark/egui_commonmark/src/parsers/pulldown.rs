@@ -437,14 +437,6 @@ impl CommonMarkViewerInternal {
     }
 }
 
-fn parser_options_math(is_math_enabled: bool) -> pulldown_cmark::Options {
-    if is_math_enabled {
-        parser_options() | pulldown_cmark::Options::ENABLE_MATH
-    } else {
-        parser_options()
-    }
-}
-
 /// Hash the layout-affecting render context.
 ///
 /// `split_points` cache y-positions, which become invalid when anything that
