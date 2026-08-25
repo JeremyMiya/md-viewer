@@ -159,6 +159,12 @@ curl -fsSL https://raw.githubusercontent.com/aydiler/md-viewer/main/scripts/inst
 
 Supports Linux x86_64 and macOS arm64 (Apple Silicon). Set `INSTALL_DIR=/usr/local/bin` to install elsewhere. Intel Macs need to build from source via `cargo install md-viewer`.
 
+On Linux, **Open File** and **Open Folder** need either a working XDG Desktop
+Portal FileChooser (plus the `gdbus` command used to detect it), or Python 3
+with Tkinter for the fallback dialog. You can check the fallback with
+`python3 -c 'import tkinter'`. Common Tkinter package names are `python3-tk` on
+Debian/Ubuntu, `python3-tkinter` on Fedora/RHEL, and `python` plus `tk` on Arch.
+
 > **macOS Gatekeeper note:** binaries are not yet signed/notarized. If macOS refuses to run the app, run:
 > `xattr -d com.apple.quarantine ~/.local/bin/md-viewer`
 
@@ -219,7 +225,8 @@ sudo pacman -S --needed \
     base-devel clang pkg-config \
     libxcb libxkbcommon openssl \
     gtk3 fontconfig dbus zenity \
-    xdg-desktop-portal xdg-desktop-portal-gtk
+    xdg-desktop-portal xdg-desktop-portal-gtk \
+    python tk
 ```
 
 ## Usage
