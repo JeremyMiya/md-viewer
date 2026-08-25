@@ -433,20 +433,22 @@ mod tests {
 
     #[cfg(feature = "math")]
     #[test]
-    fn shared_math_worker_returns_rendered_formula() {
+    fn math_worker_returns_rendered_formula() {
+        let math_job_tx = start_math_workers(1, 1);
         let (result_tx, result_rx) = mpsc::channel();
-        assert!(
-            MATH_JOB_TX
-                .try_send(MathJob {
+        assert_eq!(
+            enqueue_math_job(
+                &math_job_tx,
+                MathJob {
                     hash: 42,
                     latex: "x + y".to_owned(),
                     is_inline: true,
                     fg: egui::Color32::BLACK,
                     bg: egui::Color32::WHITE,
                     result_tx,
-                })
-                .is_ok(),
-            "math worker queue should accept a test job"
+                },
+            ),
+            MathEnqueueStatus::Queued
         );
 
         let result = result_rx
@@ -456,6 +458,34 @@ mod tests {
         assert!(result.result.is_ok());
     }
 
+    #[cfg(feature = "math")]
+    #[test]
+    fn full_math_queue_is_reported_for_retry() {
+        let (math_job_tx, _math_job_rx) = mpsc::sync_channel(1);
+        let new_job = |hash| {
+            let (result_tx, _result_rx) = mpsc::channel();
+            MathJob {
+                hash,
+                latex: "x + y".to_owned(),
+                is_inline: true,
+                fg: egui::Color32::BLACK,
+                bg: egui::Color32::WHITE,
+                result_tx,
+            }
+        };
+
+        assert_eq!(
+            enqueue_math_job(&math_job_tx, new_job(1)),
+            MathEnqueueStatus::Queued
+        );
+        assert_eq!(
+            enqueue_math_job(&math_job_tx, new_job(2)),
+            MathEnqueueStatus::Full
+        );
+    }
+
+    #[cfg(feature = "math")]
+    #[test]
     fn cjk_text_in_math_uses_real_glyphs_when_system_fallback_exists() {
         if !MATH_FONTS
             .iter()
@@ -482,6 +512,8 @@ mod tests {
             "different CJK characters must not render as the same missing-glyph box"
         );
     }
+    #[cfg(feature = "math")]
+    #[test]
     fn inline_fraction_raster_keeps_vertical_ink_margin() {
         let bg = egui::Color32::BLACK;
         let rendered = render_math_formula(
@@ -1291,13 +1323,19 @@ struct MathJob {
     result_tx: mpsc::Sender<MathRenderResult>,
 }
 
-/// Shared bounded worker pool. Formula compilation is CPU-heavy, so creating
-/// a fresh OS thread for every formula adds avoidable latency and memory use.
 #[cfg(feature = "math")]
-static MATH_JOB_TX: LazyLock<mpsc::SyncSender<MathJob>> = LazyLock::new(|| {
-    let (tx, rx) = mpsc::sync_channel::<MathJob>(64);
+#[derive(Debug, Eq, PartialEq)]
+enum MathEnqueueStatus {
+    Queued,
+    Full,
+    Disconnected,
+}
+
+#[cfg(feature = "math")]
+fn start_math_workers(worker_count: usize, queue_capacity: usize) -> mpsc::SyncSender<MathJob> {
+    let (tx, rx) = mpsc::sync_channel::<MathJob>(queue_capacity);
     let rx = Arc::new(StdMutex::new(rx));
-    for worker in 0..math_concurrency() {
+    for worker in 0..worker_count {
         let rx = Arc::clone(&rx);
         if std::thread::Builder::new()
             .name(format!("markdown-math-{worker}"))
@@ -1321,7 +1359,22 @@ static MATH_JOB_TX: LazyLock<mpsc::SyncSender<MathJob>> = LazyLock::new(|| {
         }
     }
     tx
-});
+}
+
+#[cfg(feature = "math")]
+fn enqueue_math_job(sender: &mpsc::SyncSender<MathJob>, job: MathJob) -> MathEnqueueStatus {
+    match sender.try_send(job) {
+        Ok(()) => MathEnqueueStatus::Queued,
+        Err(mpsc::TrySendError::Full(_)) => MathEnqueueStatus::Full,
+        Err(mpsc::TrySendError::Disconnected(_)) => MathEnqueueStatus::Disconnected,
+    }
+}
+
+/// Shared bounded worker pool. Formula compilation is CPU-heavy, so creating
+/// a fresh OS thread for every formula adds avoidable latency and memory use.
+#[cfg(feature = "math")]
+static MATH_JOB_TX: LazyLock<mpsc::SyncSender<MathJob>> =
+    LazyLock::new(|| start_math_workers(math_concurrency(), 64));
 
 /// Typst preamble defining mitex helper functions needed to compile mitex output.
 /// These map mitex's custom function names to standard Typst math functions.
@@ -1740,7 +1793,13 @@ fn render_math_with_layout(
         && !cache.math_rendering.contains(&hash)
         && cache.math_rendering.len() < math_concurrency()
     {
-        spawn_math_render(hash, latex, is_inline, fg, bg, cache);
+        if spawn_math_render(hash, latex, is_inline, fg, bg, cache) == MathEnqueueStatus::Full {
+            // The shared queue is bounded. Retry promptly after workers have
+            // had a chance to drain it instead of silently waiting for an
+            // unrelated UI event to revisit this formula.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(16));
+        }
     }
 
     // Display based on current state
@@ -1875,7 +1934,7 @@ fn spawn_math_render(
     fg: egui::Color32,
     bg: egui::Color32,
     cache: &mut CommonMarkCache,
-) {
+) -> MathEnqueueStatus {
     let job = MathJob {
         hash,
         latex: latex.to_owned(),
@@ -1884,18 +1943,20 @@ fn spawn_math_render(
         bg,
         result_tx: cache.math_tx.clone(),
     };
-    match MATH_JOB_TX.try_send(job) {
-        Ok(()) => {
+    let status = enqueue_math_job(&MATH_JOB_TX, job);
+    match status {
+        MathEnqueueStatus::Queued => {
             cache.math_rendering.insert(hash);
         }
-        Err(mpsc::TrySendError::Full(_)) => {}
-        Err(mpsc::TrySendError::Disconnected(_)) => {
+        MathEnqueueStatus::Full => {}
+        MathEnqueueStatus::Disconnected => {
             cache.math_states.insert(
                 hash,
                 MathState::Error("math renderer workers are unavailable".to_owned()),
             );
         }
     }
+    status
 }
 
 #[cfg(not(feature = "better_syntax_highlighting"))]
