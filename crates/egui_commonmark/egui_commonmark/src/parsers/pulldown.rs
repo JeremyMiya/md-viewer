@@ -249,8 +249,11 @@ fn table_cell_height(
     line_height: f32,
     cache: &CommonMarkCache,
     ui: &Ui,
+    column_width: f32,
 ) -> f32 {
-    let mut height = line_height * 1.5 * cell_visual_lines(cell) as f32;
+    let text = markdown_cell_text(cell);
+    let mut height = wrapped_text_height(ui, &text, column_width, line_height)
+        .max(line_height * 1.5 * cell_visual_lines(cell) as f32);
     for (event, _) in cell {
         if let pulldown_cmark::Event::InlineMath(_tex) = event {
             let conservative = line_height * 2.0;
@@ -269,16 +272,78 @@ fn table_cell_height(
     height
 }
 
-/// Heuristic visual-line count for an HTML-table cell (rendered as a plain
-/// `RichText` string, not as a markdown event stream). Counts explicit
-/// newlines and adds a crude wrap estimate of ~60 chars per visual line.
-/// Over-estimates slightly by design — extra row height is preferable to
-/// clipping. Exact estimation would require knowing the rendered column
-/// width up front, which TableBuilder doesn't expose before render.
-fn html_cell_visual_lines(cell: &str) -> usize {
-    let explicit_lines = cell.lines().count().max(1);
-    let wrap_est = cell.len().saturating_sub(1) / 60;
-    explicit_lines.saturating_add(wrap_est).max(1)
+fn markdown_cell_text(cell: &[(pulldown_cmark::Event, Range<usize>)]) -> String {
+    let mut text = String::new();
+    for (event, _) in cell {
+        match event {
+            pulldown_cmark::Event::Text(value)
+            | pulldown_cmark::Event::Code(value)
+            | pulldown_cmark::Event::InlineHtml(value)
+            | pulldown_cmark::Event::Html(value)
+            | pulldown_cmark::Event::FootnoteReference(value)
+            | pulldown_cmark::Event::InlineMath(value)
+            | pulldown_cmark::Event::DisplayMath(value) => text.push_str(value),
+            pulldown_cmark::Event::SoftBreak | pulldown_cmark::Event::HardBreak => text.push('\n'),
+            pulldown_cmark::Event::TaskListMarker(checked) => {
+                text.push_str(if *checked { "[x] " } else { "[ ] " });
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+fn natural_text_width(ui: &Ui, text: &str) -> f32 {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    text.lines()
+        .map(|line| {
+            ui.painter()
+                .layout_no_wrap(line.to_owned(), font_id.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max)
+        + 16.0
+}
+
+fn wrapped_text_height(ui: &Ui, text: &str, column_width: f32, line_height: f32) -> f32 {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let galley = ui.painter().layout(
+        text.to_owned(),
+        font_id,
+        egui::Color32::WHITE,
+        (column_width - 8.0).max(1.0),
+    );
+    line_height * 1.5 * galley.rows.len().max(1) as f32
+}
+
+/// Preserve naturally narrow columns while sharing the remaining width among
+/// wider columns. If even the minimum widths do not fit, horizontal scrolling
+/// remains available.
+fn fit_column_widths(desired: &[f32], available: f32, minimum: f32) -> Vec<f32> {
+    if desired.is_empty() {
+        return Vec::new();
+    }
+    let desired: Vec<f32> = desired.iter().map(|width| width.max(minimum)).collect();
+    if desired.iter().sum::<f32>() <= available {
+        return desired;
+    }
+    if available <= minimum * desired.len() as f32 {
+        return vec![minimum; desired.len()];
+    }
+
+    let mut low = minimum;
+    let mut high = desired.iter().copied().fold(minimum, f32::max);
+    for _ in 0..24 {
+        let cap = (low + high) * 0.5;
+        let total: f32 = desired.iter().map(|width| width.min(cap)).sum();
+        if total > available {
+            high = cap;
+        } else {
+            low = cap;
+        }
+    }
+    desired.into_iter().map(|width| width.min(low)).collect()
 }
 
 /// Redirect Shift+vertical-wheel over a hovered wide-table into its inner
@@ -467,12 +532,6 @@ fn compute_layout_signature(ui: &egui::Ui, options: &CommonMarkOptions) -> u64 {
     options.indentation_spaces.hash(&mut h);
     h.finish()
 }
-
-/// Threshold for content-height drift from the last bootstrap that triggers a
-/// re-bootstrap to refresh split_points. Larger than the known ~44px egui
-/// oscillation between show()/show_viewport() content-size reporting, but
-/// small enough to catch real image-load growth.
-const CONTENT_H_DRIFT_THRESHOLD: f32 = 1024.0;
 
 /// Whether a TagEnd marks a safe block-level boundary for viewport-skip.
 ///
@@ -673,6 +732,7 @@ impl CommonMarkViewerInternal {
             ui.spacing_mut().item_spacing.x = 0.0;
             let height = ui.text_style_height(&TextStyle::Body);
             ui.set_row_height(height);
+            let content_origin_y = ui.next_widget_position().y;
 
             // Use cached events — clone the Vec reference data for iteration
             // (events are 'static so this is cheap pointer copies, not re-parsing)
@@ -729,15 +789,28 @@ impl CommonMarkViewerInternal {
                         let scroll_cache = scroll_cache(cache, &source_id);
                         let end_position = ui.next_widget_position();
 
+                        let split_index = index.saturating_add(1);
                         let split_point_exists = scroll_cache
                             .split_points
                             .iter()
-                            .any(|(i, _, _)| *i == index);
+                            .any(|(i, _, _)| *i == split_index);
 
                         if !split_point_exists {
-                            scroll_cache
-                                .split_points
-                                .push((index, start_position, end_position));
+                            let relative_start = egui::pos2(
+                                start_position.x,
+                                (start_position.y - content_origin_y).max(0.0),
+                            );
+                            let relative_end = egui::pos2(
+                                end_position.x,
+                                (end_position.y - content_origin_y).max(0.0),
+                            );
+                            // Resume after this complete block. Starting at
+                            // its End tag would omit the matching Start state.
+                            scroll_cache.split_points.push((
+                                split_index,
+                                relative_start,
+                                relative_end,
+                            ));
                         }
                     }
                 }
@@ -748,8 +821,9 @@ impl CommonMarkViewerInternal {
             }
 
             if let Some(source_id) = split_points_id {
+                let content_height = (ui.next_widget_position().y - content_origin_y).max(0.0);
                 scroll_cache(cache, &source_id).page_size =
-                    Some(ui.next_widget_position().to_vec2());
+                    Some(egui::vec2(max_width, content_height));
             }
         });
 
@@ -771,6 +845,7 @@ impl CommonMarkViewerInternal {
         let available_size = ui.available_size();
         let scroll_id = source_id.with("_scroll_area");
         let layout_sig = compute_layout_signature(ui, options);
+        let layout_revision = cache.layout_revision();
 
         // Ensure parsed events are cached on the ScrollableCache, keyed by a
         // content version. The caller can provide a monotonic version (bumped
@@ -779,11 +854,11 @@ impl CommonMarkViewerInternal {
         // The big win either way is avoiding pulldown_cmark::Parser::new_ext +
         // collect on every frame (~52 ms at 100k lines).
         let version = content_version.unwrap_or_else(|| Self::hash_content(text));
-        let mut content_changed = false;
+        let mut layout_invalidated = false;
         {
             let sc = scroll_cache(cache, &source_id);
             if sc.events.is_empty() || sc.content_version != version {
-                content_changed = true;
+                layout_invalidated = true;
                 // Must mirror `show()`'s `math_enabled` derivation
                 // (parsers/pulldown.rs in this file: `options.math_fn.is_some()
                 // || cfg!(feature = "math")`). The bootstrap branch below
@@ -812,10 +887,17 @@ impl CommonMarkViewerInternal {
             // Width/zoom/theme change: y-coordinates are invalid for the
             // new layout, even though parsed events are still good.
             if sc.layout_signature != layout_sig {
+                layout_invalidated = true;
                 sc.layout_signature = layout_sig;
                 sc.page_size = None;
                 sc.split_points.clear();
                 sc.available_size = available_size;
+            }
+            if sc.layout_revision != layout_revision {
+                layout_invalidated = true;
+                sc.layout_revision = layout_revision;
+                sc.page_size = None;
+                sc.split_points.clear();
             }
             // When the caller wants to jump to a specific scroll position
             // (outline click, search-jump), we must paint *every* event
@@ -827,44 +909,18 @@ impl CommonMarkViewerInternal {
             // full-paint frame (~100 ms at 100k lines) per jump, which is
             // acceptable for a one-off action.
             //
-            // Critically, we DO NOT clear split_points here even though
-            // `page_size = None` forces a bootstrap. Reason: split_points
-            // store screen-y coordinates which are only meaningful at the
-            // scroll position they were captured at. The original scroll=0
-            // bootstrap stored values where screen-y ≈ content-y + panel
-            // chrome (~44 px). Clearing here lets the forced bootstrap at
-            // non-zero scroll re-populate them with screen-y values that
-            // diverge from content-y by the scroll amount, breaking every
-            // subsequent skip-paint's partition_point / allocate_space math
-            // by hundreds of pixels (visible as outline-click landing at
-            // the wrong heading and blank space at viewport top after
-            // scrolling). The push-site dedup-by-event-index keeps the
-            // original (good) values intact even though bootstrap re-runs.
+            // Keep the already-valid split points: this bootstrap is needed
+            // to paint every event for the jump, not to recompute geometry.
+            // The push site deduplicates by event index, so the full render
+            // can still refresh page_size without rebuilding the split list.
             if pending_scroll_offset.is_some() {
                 sc.page_size = None;
-            }
-            // Content-height drift check: if the previous frame's content
-            // height has drifted from when split_points were captured by
-            // more than CONTENT_H_DRIFT_THRESHOLD, the y-positions are stale
-            // (typically because async image/font loading shifted the doc
-            // after the initial bootstrap). Invalidate to trigger ONE
-            // re-bootstrap with refreshed positions. Uses absolute-drift
-            // hysteresis instead of bucketing because egui's `show()` vs
-            // `show_viewport()` content_size.y reporting differs by ~44 px
-            // (panel chrome) for the same content — any bucket-boundary
-            // approach would oscillate; only |drift| > threshold breaks
-            // out of that cycle.
-            if sc.bootstrap_content_h > 0.0
-                && (sc.last_content_h - sc.bootstrap_content_h).abs() > CONTENT_H_DRIFT_THRESHOLD
-            {
-                sc.page_size = None;
-                sc.split_points.clear();
             }
         }
         // Header positions are content-keyed; new content means the cached
         // y values point at the wrong headings. Done outside the `sc` borrow
         // scope above so `cache` is reborrowable.
-        if content_changed {
+        if layout_invalidated {
             cache.clear_header_positions();
         }
 
@@ -882,163 +938,122 @@ impl CommonMarkViewerInternal {
             sa
         };
 
-        // FORCE BOOTSTRAP EVERY FRAME: disable viewport-virtualization until
-        // the skip-paint slicing bugs are fully resolved (see
-        // docs/devlog/030-skip-paint-investigation.md for the design plan).
-        // The slice path renders events without their preceding container
-        // context (Start tags before the slice are missing), producing
-        // layout differences vs bootstrap — visible as flicker, wrong
-        // spacing, and shifted indents during scroll. Bootstrap renders
-        // the full document each frame; measured on T470 (i5-7200U, 2c):
-        // 1.2 ms / 348 events, 5.7 ms / 2514 events, 39 ms / 20k events,
-        // 229 ms / 100k events. Acceptable up to ~10k events; degraded
-        // above. The skip-paint code below is kept as `unreachable!`
-        // so future restoration can drop the early return.
-        {
+        // Bootstrap once after content/layout invalidation. It records safe
+        // top-level block boundaries and content-relative positions. Normal
+        // frames then paint only the viewport slice between clean boundaries.
+        if scroll_cache(cache, &source_id).page_size.is_none() {
             let out = make_scroll_area().show(ui, |ui| {
                 cache.set_scroll_offset(pending_scroll_offset.unwrap_or(0.0));
                 self.show(ui, cache, options, text, Some(source_id));
             });
             let sc = scroll_cache(cache, &source_id);
+            if let Some(page_size) = &mut sc.page_size {
+                // The ScrollArea output is the canonical extent. Nested
+                // widgets such as tables may advance the inner cursor beyond
+                // the space actually allocated by their outer response.
+                page_size.y = out.content_size.y;
+            }
             sc.available_size = available_size;
-            sc.last_content_h = out.content_size.y;
-            sc.bootstrap_content_h = out.content_size.y;
             return out;
         }
-        // Kept for future restoration once skip-paint is bug-free.
-        #[allow(unreachable_code)]
         let page_size_opt = scroll_cache(cache, &source_id).page_size;
-        #[allow(unreachable_code)]
         let Some(page_size) = page_size_opt else {
             unreachable!()
         };
 
         let num_rows = scroll_cache(cache, &source_id).events.len();
 
-        let out = make_scroll_area()
-            .show_viewport(ui, |ui, viewport| {
-                ui.set_height(page_size.y);
-                // ui.cursor().top() inside show_viewport is viewport-relative;
-                // record_header_position and record_active_search_y_viewport
-                // add this offset to recover content-relative y.
-                cache.set_scroll_offset(viewport.min.y);
-                let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
+        let out = make_scroll_area().show_viewport(ui, |ui, viewport| {
+            ui.set_height(page_size.y);
+            // The cursor inside show_viewport is viewport-relative; adding
+            // this offset recovers content-relative heading/search positions.
+            cache.set_scroll_offset(viewport.min.y);
+            let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
+            let max_width = options.max_width(ui);
 
-                let max_width = options.max_width(ui);
-                ui.allocate_ui_with_layout(egui::vec2(max_width, 0.0), layout, |ui| {
+            let (first_event_index, first_end_y, last_end_y, events_range) = {
+                let scroll_cache = scroll_cache(cache, &source_id);
+
+                // Keep one complete block of safety margin on both sides of
+                // the viewport, and only resume after a complete block.
+                let above = scroll_cache
+                    .split_points
+                    .partition_point(|(_, _, end)| end.y < viewport.min.y);
+                let (first_event_index, _, first_end_position) = if above >= 2 {
+                    scroll_cache.split_points[above - 2]
+                } else {
+                    (0, Pos2::ZERO, Pos2::ZERO)
+                };
+
+                let below = scroll_cache
+                    .split_points
+                    .partition_point(|(_, start, _)| start.y <= viewport.max.y);
+                let last_split = scroll_cache.split_points.get(below + 1);
+                let last_event_index = last_split
+                    .map(|(index, _, _)| *index)
+                    .unwrap_or(num_rows);
+                let last_end_y = last_split
+                    .map(|(_, _, end)| end.y)
+                    .unwrap_or(page_size.y);
+
+                let range_end = last_event_index.min(scroll_cache.events.len());
+                let events_range = if first_event_index < range_end {
+                    scroll_cache.events[first_event_index..range_end].to_vec()
+                } else {
+                    Vec::new()
+                };
+
+                (
+                    first_event_index,
+                    first_end_position.y,
+                    last_end_y,
+                    events_range,
+                )
+            };
+
+            // Match egui's show_rows strategy: size the parent to the full
+            // document, then place only the visible slice in an absolute child.
+            let content_top = ui.max_rect().top();
+            let slice_top = content_top + first_end_y;
+            let slice_bottom = (content_top + last_end_y.min(page_size.y)).max(slice_top);
+            let slice_rect = egui::Rect::from_x_y_ranges(
+                ui.max_rect().left()..=ui.max_rect().left() + max_width,
+                slice_top..=slice_bottom,
+            );
+
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(slice_rect).layout(layout),
+                |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    let scroll_cache = scroll_cache(cache, &source_id);
+                    ui.set_row_height(ui.text_style_height(&TextStyle::Body));
 
-                    // split_points are populated in event order, which matches
-                    // top-to-bottom layout order, so y-coords are monotonic
-                    // non-decreasing. Binary-search instead of linear filter:
-                    // O(log N) vs the old O(N) at 15k+ split points (100k-line doc).
-
-                    // First waypoint: the second-to-last split point whose
-                    // end.y is still above the viewport. Picking "second-to-last"
-                    // gives us a safety frame above the viewport top to avoid
-                    // clipping inline-flow content that started just above.
-                    let above = scroll_cache
-                        .split_points
-                        .partition_point(|(_, _, end)| end.y < viewport.min.y);
-                    let (first_event_index, _, first_end_position) = if above >= 2 {
-                        scroll_cache.split_points[above - 2]
-                    } else {
-                        (0, Pos2::ZERO, Pos2::ZERO)
-                    };
-
-                    // Last waypoint: the second split point whose start.y is
-                    // strictly below the viewport bottom. Same safety idea on
-                    // the bottom edge.
-                    let below = scroll_cache
-                        .split_points
-                        .partition_point(|(_, start, _)| start.y <= viewport.max.y);
-                    let last_event_index = scroll_cache
-                        .split_points
-                        .get(below + 1)
-                        .map(|(index, _, _)| *index)
-                        .unwrap_or(num_rows);
-
-                    // Clone only the events we'll actually iterate this frame
-                    // — the visible viewport plus safety margins above/below.
-                    // The previous implementation cloned the full Vec (~1.5 ms
-                    // at 30k events on Recent-Changes.md), then `skip`ed all
-                    // but ~150 events. This trims the clone to the actual
-                    // range used, dropping per-frame allocation churn from
-                    // ~1.5 ms to ~10 µs on the same doc. The slice clone is
-                    // released before `process_event` mutably re-borrows the
-                    // cache for syntect/header state — NLL covers this.
-                    let range_end = last_event_index.min(scroll_cache.events.len());
-                    let events_range: Vec<(pulldown_cmark::Event<'static>, Range<usize>)> =
-                        if first_event_index < range_end {
-                            scroll_cache.events[first_event_index..range_end].to_vec()
-                        } else {
-                            Vec::new()
-                        };
-
-                    let last_sp_y_used = scroll_cache
-                        .split_points
-                        .get(below + 1)
-                        .map(|p| p.2.y)
-                        .unwrap_or(0.0);
-                    eprintln!(
-                        "[SKIP] vp=[{:.0},{:.0}] evt=[{},{}]/{} sp_y=[{:.0},{:.0}] a={} b={}",
-                        viewport.min.y, viewport.max.y,
-                        first_event_index, last_event_index, num_rows,
-                        first_end_position.y, last_sp_y_used,
-                        above, below
-                    );
-                    // Advance cursor VERTICALLY by first_end_position.y to
-                    // position events at the right viewport y. `to_vec2()`
-                    // would also pass first_end_position.x as allocation
-                    // width — that's the X-cursor where the previous block
-                    // ended (often a non-zero left margin or a list-indent
-                    // depth). In `left_to_right(BOTTOM).with_main_wrap`,
-                    // allocate_space consumes that as width-advance,
-                    // shifting subsequent events right and breaking
-                    // indentation of code blocks, tables, and text.
-                    ui.allocate_space(egui::vec2(0.0, first_end_position.y));
-
-                    // Re-attach original indices via map so peekable iteration
-                    // and downstream consumers still see the absolute event
-                    // index (used by `if i == 0 { ... }` below for the
-                    // bootstrap-newline gate).
                     let mut events = events_range
                         .into_iter()
                         .enumerate()
-                        .map(|(offset, ev)| (offset + first_event_index, ev))
+                        .map(|(offset, event)| (offset + first_event_index, event))
                         .peekable();
 
-                    while let Some((i, (e, src_span))) = events.next() {
+                    while let Some((index, (event, src_span))) = events.next() {
                         if events.peek().is_none() {
                             self.line.should_end_newline_forced = false;
                         }
-
-                        self.process_event(ui, &mut events, e, src_span, cache, options, max_width);
-
-                        if i == 0 {
+                        self.process_event(
+                            ui,
+                            &mut events,
+                            event,
+                            src_span,
+                            cache,
+                            options,
+                            max_width,
+                        );
+                        if index == 0 {
                             self.line.should_not_start_newline_forced = false;
                         }
                     }
-                });
-            });
-        // NOTE: deliberately NOT updating last_content_h from skip-paint's
-        // `out.content_size.y`. That value is unreliable: skip-paint does
-        // `set_height(page_size.y)` (min height) then `allocate_space(Vec2(0,
-        // first_end_position.y))` which can advance the cursor by tens of
-        // thousands of px when scrolled deep — content_size.y inflates to
-        // 2× the real document height. Feeding that into the drift check
-        // triggers an invalidation, re-bootstrap fires at the current
-        // (non-zero) scroll, split_points get repopulated with screen-y
-        // coords that are catastrophically off, the next skip-paint picks
-        // wrong events, content_h spikes the other way, drift fires again
-        // — death spiral. Empirically: 619 bootstraps in 30 s of scroll on
-        // T470, panel flickered blank with garbled styling. Restricting
-        // drift signal to bootstrap-only content_h prevents the false
-        // positive. Async-image-load growth is still caught — that fires
-        // during the SECOND bootstrap (which is allowed to happen for
-        // other reasons, e.g. font/scrollbar layout settling at startup),
-        // where the new content_h IS written to last_content_h.
+                },
+            );
+        });
+        // The absolutely positioned slice preserves the bootstrap content extent.
 
         // Scroll-overshoot clamp.
         let real_max_scroll = (page_size.y - out.inner_rect.height()).max(0.0);
@@ -1249,19 +1264,6 @@ impl CommonMarkViewerInternal {
                 return;
             }
             let cell_h = line_h * 1.5;
-            let header_h = header
-                .iter()
-                .map(|cell| table_cell_height(cell, line_h, cache, ui))
-                .fold(cell_h, f32::max);
-            let body_heights: Vec<f32> = rows
-                .iter()
-                .map(|row| {
-                    row
-                        .iter()
-                        .map(|cell| table_cell_height(cell, line_h, cache, ui))
-                        .fold(cell_h, f32::max)
-                })
-                .collect();
             // Outer ScrollArea::horizontal handles the case where columns
             // (auto-sized to content) total wider than the parent ui; without it,
             // narrow windows clip the rightmost columns. Plain vertical wheel
@@ -1280,6 +1282,23 @@ impl CommonMarkViewerInternal {
                 .table_max_width
                 .map(|w| w as f32)
                 .unwrap_or(max_width);
+            let mut table_rows = Vec::with_capacity(rows.len() + usize::from(!header.is_empty()));
+            if !header.is_empty() {
+                table_rows.push(header);
+            }
+            table_rows.extend(rows);
+            let desired_widths: Vec<f32> = (0..num_cols)
+                .map(|column| {
+                    table_rows
+                        .iter()
+                        .filter_map(|row| row.get(column))
+                        .map(|cell| natural_text_width(ui, &markdown_cell_text(cell)))
+                        .fold(40.0, f32::max)
+                })
+                .collect();
+            let column_space = ui.spacing().item_spacing.x * num_cols.saturating_sub(1) as f32;
+            let initial_widths =
+                fit_column_widths(&desired_widths, (table_bound - column_space).max(0.0), 40.0);
             // The document ui is allocated at the prose width, and a child ui
             // can never exceed its parent's allocation — so a wider viewport
             // must be carved out explicitly. egui does not clamp an explicit
@@ -1299,8 +1318,8 @@ impl CommonMarkViewerInternal {
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
                                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                                    let table = egui_extras::TableBuilder::new(ui)
-                                        .id_salt(id)
+                                    let mut builder = egui_extras::TableBuilder::new(ui)
+                                        .id_salt(id.with("_wrapped"))
                                         .striped(true)
                                         .resizable(true)
                                         .vscroll(false)
@@ -1312,48 +1331,48 @@ impl CommonMarkViewerInternal {
                                         // max_width and provides horizontal scroll.
                                         .auto_shrink([true, true])
                                         .min_scrolled_height(0.0)
-                                        .cell_layout(egui::Layout::left_to_right(
-                                            egui::Align::Center,
-                                        ))
-                                        .columns(
-                                            egui_extras::Column::auto()
+                                        .cell_layout(egui::Layout::left_to_right(egui::Align::Min));
+                                    for width in initial_widths {
+                                        builder = builder.column(
+                                            egui_extras::Column::initial(width)
                                                 .resizable(true)
+                                                .clip(true)
                                                 .at_least(40.0),
-                                            num_cols,
-                                        )
-                                        .header(header_h, |mut row| {
-                                            for col in header {
-                                                row.col(|ui| {
-                                                    let col_w = ui.available_width();
-                                                    for (e, src_span) in col {
-                                                        let tmp_start = std::mem::replace(
-                                                            &mut self.line.should_start_newline,
-                                                            false,
-                                                        );
-                                                        let tmp_end = std::mem::replace(
-                                                            &mut self.line.should_end_newline,
-                                                            false,
-                                                        );
-                                                        self.event(
-                                                            ui, e, src_span, cache, options,
-                                                            col_w,
-                                                        );
-                                                        self.line.should_start_newline = tmp_start;
-                                                        self.line.should_end_newline = tmp_end;
-                                                    }
-                                                });
-                                            }
-                                        });
-                                    table.body(|mut body| {
-                                        for (row_idx, row) in rows.into_iter().enumerate() {
-                                            let h = body_heights
-                                                .get(row_idx)
-                                                .copied()
-                                                .unwrap_or(cell_h);
-                                            body.row(h, |mut row_ui| {
+                                        );
+                                    }
+                                    builder.body(|mut body| {
+                                        let widths = body.widths().to_vec();
+                                        let heights: Vec<f32> = {
+                                            let measure_ui = body.ui_mut();
+                                            table_rows
+                                                .iter()
+                                                .map(|row| {
+                                                    row.iter()
+                                                        .enumerate()
+                                                        .map(|(column, cell)| {
+                                                            table_cell_height(
+                                                                cell,
+                                                                line_h,
+                                                                cache,
+                                                                measure_ui,
+                                                                widths
+                                                                    .get(column)
+                                                                    .copied()
+                                                                    .unwrap_or(40.0),
+                                                            )
+                                                        })
+                                                        .fold(cell_h, f32::max)
+                                                })
+                                                .collect()
+                                        };
+                                        body.heterogeneous_rows(heights.into_iter(), |mut row_ui| {
+                                            let row = &table_rows[row_ui.index()];
                                                 for col in row {
                                                     row_ui.col(|ui| {
-                                                        let col_w = ui.available_width();
+                                                        ui.style_mut().wrap_mode =
+                                                            Some(egui::TextWrapMode::Wrap);
+                                                        let col_w = ui.max_rect().width();
+                                                        ui.set_width(col_w);
                                                         for (e, src_span) in col {
                                                             let tmp_start = std::mem::replace(
                                                                 &mut self.line.should_start_newline,
@@ -1364,7 +1383,11 @@ impl CommonMarkViewerInternal {
                                                                 false,
                                                             );
                                                             self.event(
-                                                                ui, e, src_span, cache, options,
+                                                                ui,
+                                                                e.clone(),
+                                                                src_span.clone(),
+                                                                cache,
+                                                                options,
                                                                 col_w,
                                                             );
                                                             self.line.should_start_newline =
@@ -1373,8 +1396,7 @@ impl CommonMarkViewerInternal {
                                                         }
                                                     });
                                                 }
-                                            });
-                                        }
+                                        });
                                     });
                                 });
                             });
@@ -1594,6 +1616,8 @@ impl CommonMarkViewerInternal {
                 .push_str(raw_heading_text.unwrap_or(&text));
             // Accumulate RichText - will render all at once in end_tag(Heading)
             self.current_heading_rich_texts.push(rich_text);
+        } else if self.is_table {
+            ui.add(egui::Label::new(rich_text).wrap());
         } else {
             ui.label(rich_text);
         }
@@ -2084,30 +2108,6 @@ impl CommonMarkViewerInternal {
             return;
         }
 
-        // Heuristic per-row heights: count explicit newlines + crude wrap est at
-        // ~60 chars/visual-line. Over-estimates slightly (extra row height is
-        // preferable to clipping). Header rows use the same heuristic.
-        let row_height_for = |cells: &[String]| -> f32 {
-            let max_lines = cells
-                .iter()
-                .map(|c| html_cell_visual_lines(c))
-                .max()
-                .unwrap_or(1);
-            cell_h * max_lines as f32
-        };
-        let header_h = table
-            .header
-            .first()
-            .map(|row| row_height_for(row))
-            .unwrap_or(cell_h);
-        let extra_header_heights: Vec<f32> = table
-            .header
-            .iter()
-            .skip(1)
-            .map(|row| row_height_for(row))
-            .collect();
-        let body_heights: Vec<f32> = table.rows.iter().map(|row| row_height_for(row)).collect();
-
         // Outer ScrollArea::horizontal handles wide tables that exceed parent width;
         // ui.vertical() prevents the header/body Y-overlap quirk. Plain vertical wheel
         // stays with the outer document scroller (#22); Shift+wheel opts in to
@@ -2117,6 +2117,24 @@ impl CommonMarkViewerInternal {
             .table_max_width
             .map(|w| w as f32)
             .unwrap_or(max_width);
+        let table_rows: Vec<(bool, &[String])> = table
+            .header
+            .iter()
+            .map(|row| (true, row.as_slice()))
+            .chain(table.rows.iter().map(|row| (false, row.as_slice())))
+            .collect();
+        let desired_widths: Vec<f32> = (0..num_cols)
+            .map(|column| {
+                table_rows
+                    .iter()
+                    .filter_map(|(_, row)| row.get(column))
+                    .map(|cell| natural_text_width(ui, cell))
+                    .fold(40.0, f32::max)
+            })
+            .collect();
+        let column_space = ui.spacing().item_spacing.x * num_cols.saturating_sub(1) as f32;
+        let initial_widths =
+            fit_column_widths(&desired_widths, (table_bound - column_space).max(0.0), 40.0);
         // Same reading-column escape as markdown tables (#64): carve out a
         // scope wider than the prose allocation, anchored at the cursor.
         let mut table_scope_rect = ui.cursor();
@@ -2131,8 +2149,8 @@ impl CommonMarkViewerInternal {
                     .show(ui, |ui| {
                 ui.vertical(|ui| {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
-                        let builder = egui_extras::TableBuilder::new(ui)
-                            .id_salt(id)
+                        let mut builder = egui_extras::TableBuilder::new(ui)
+                            .id_salt(id.with("_wrapped"))
                             .striped(true)
                             .resizable(true)
                             .vscroll(false)
@@ -2140,11 +2158,15 @@ impl CommonMarkViewerInternal {
                             // outer ScrollArea still handles wide-table overflow.
                             .auto_shrink([true, true])
                             .min_scrolled_height(0.0)
-                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                            .columns(
-                                egui_extras::Column::auto().resizable(true).at_least(40.0),
-                                num_cols,
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Min));
+                        for width in initial_widths {
+                            builder = builder.column(
+                                egui_extras::Column::initial(width)
+                                    .resizable(true)
+                                    .clip(true)
+                                    .at_least(40.0),
                             );
+                        }
 
                         let render_cell_strong = |ui: &mut Ui, cell: &str| {
                             egui::Frame::NONE
@@ -2154,82 +2176,49 @@ impl CommonMarkViewerInternal {
                                 });
                         };
 
-                        if let Some(first_header) = table.header.first() {
-                            builder
-                                .header(header_h, |mut row| {
-                                    for cell in first_header {
-                                        row.col(|ui| render_cell_strong(ui, cell));
-                                    }
-                                })
-                                .body(|mut body| {
-                                    // Extra header rows after the first render as bold
-                                    // body rows (TableBuilder has only one native header row).
-                                    for (idx, extra) in table.header.iter().skip(1).enumerate() {
-                                        let h = extra_header_heights
-                                            .get(idx)
-                                            .copied()
-                                            .unwrap_or(cell_h);
-                                        body.row(h, |mut row_ui| {
-                                            for cell in extra {
-                                                row_ui.col(|ui| render_cell_strong(ui, cell));
-                                            }
-                                        });
-                                    }
-                                    for (row_idx, row) in table.rows.iter().enumerate() {
-                                        let h = body_heights
-                                            .get(row_idx)
-                                            .copied()
-                                            .unwrap_or(cell_h);
-                                        body.row(h, |mut row_ui| {
-                                            for cell in row {
-                                                row_ui.col(|ui| {
-                                                    egui::Frame::NONE
-                                                        .inner_margin(egui::Margin::symmetric(
-                                                            8, 4,
-                                                        ))
-                                                        .show(ui, |ui| {
-                                                            let rich_text = self
-                                                                .text_style
-                                                                .to_richtext_with_options(
-                                                                    ui,
-                                                                    cell,
-                                                                    options,
-                                                                );
-                                                            ui.label(rich_text);
-                                                        });
+                        builder.body(|mut body| {
+                            let widths = body.widths().to_vec();
+                            let heights: Vec<f32> = {
+                                let measure_ui = body.ui_mut();
+                                table_rows
+                                    .iter()
+                                    .map(|(_, row)| {
+                                        row.iter()
+                                            .enumerate()
+                                            .map(|(column, cell)| {
+                                                wrapped_text_height(
+                                                    measure_ui,
+                                                    cell,
+                                                    widths.get(column).copied().unwrap_or(40.0)
+                                                        - 16.0,
+                                                    line_h,
+                                                ) + 8.0
+                                            })
+                                            .fold(cell_h, f32::max)
+                                    })
+                                    .collect()
+                            };
+                            body.heterogeneous_rows(heights.into_iter(), |mut row_ui| {
+                                let (is_header, row) = table_rows[row_ui.index()];
+                                for cell in row {
+                                    row_ui.col(|ui| {
+                                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                        if is_header {
+                                            render_cell_strong(ui, cell);
+                                        } else {
+                                            egui::Frame::NONE
+                                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                                .show(ui, |ui| {
+                                                    let rich_text = self
+                                                        .text_style
+                                                        .to_richtext_with_options(ui, cell, options);
+                                                    ui.label(rich_text);
                                                 });
-                                            }
-                                        });
-                                    }
-                                });
-                        } else {
-                            builder.body(|mut body| {
-                                for (row_idx, row) in table.rows.iter().enumerate() {
-                                    let h = body_heights
-                                        .get(row_idx)
-                                        .copied()
-                                        .unwrap_or(cell_h);
-                                    body.row(h, |mut row_ui| {
-                                        for cell in row {
-                                            row_ui.col(|ui| {
-                                                egui::Frame::NONE
-                                                    .inner_margin(egui::Margin::symmetric(8, 4))
-                                                    .show(ui, |ui| {
-                                                        let rich_text = self
-                                                            .text_style
-                                                            .to_richtext_with_options(
-                                                                ui,
-                                                                cell,
-                                                                options,
-                                                            );
-                                                        ui.label(rich_text);
-                                                    });
-                                            });
                                         }
                                     });
                                 }
                             });
-                        }
+                        });
                     });
                 });
             });
@@ -2307,7 +2296,78 @@ mod tests {
             let line_height = ui.text_style_height(&egui::TextStyle::Body);
             let cell = vec![(Event::InlineMath(r"\frac{a}{b}".into()), 0..11)];
 
-            assert!(table_cell_height(&cell, line_height, &cache, ui) >= line_height * 2.0);
+            assert!(
+                table_cell_height(&cell, line_height, &cache, ui, 120.0) >= line_height * 2.0
+            );
+        });
+    }
+
+    #[test]
+    fn fitted_table_columns_preserve_narrow_content() {
+        let widths = fit_column_widths(&[60.0, 500.0, 120.0], 360.0, 40.0);
+        assert!((widths[0] - 60.0).abs() < 0.1);
+        assert!((widths[2] - 120.0).abs() < 0.1);
+        assert!((widths.iter().sum::<f32>() - 360.0).abs() < 0.1);
+        assert!(widths[1] > widths[2]);
+    }
+
+    #[test]
+    fn fitted_table_columns_keep_minimum_for_horizontal_overflow() {
+        assert_eq!(
+            fit_column_widths(&[100.0, 200.0, 300.0], 100.0, 40.0),
+            vec![40.0; 3]
+        );
+    }
+
+    #[test]
+    fn scrollable_renderer_resumes_only_after_complete_blocks() {
+        egui::__run_test_ui(|ui| {
+            ui.set_width(600.0);
+            ui.set_height(300.0);
+            let markdown = concat!(
+                "# Heading\n\n",
+                "Paragraph before.\n\n",
+                "- outer\n  - nested\n  - nested two\n- second\n\n",
+                "> quoted\n> continuation\n\n",
+                "| a | b |\n|---|---|\n| one | two |\n\n",
+                "Final paragraph.\n",
+            );
+            let source_id = egui::Id::new("virtualization-regression");
+            let mut cache = CommonMarkCache::default();
+            let options = CommonMarkOptions::default();
+
+            CommonMarkViewerInternal::new().show_scrollable(
+                source_id,
+                ui,
+                &mut cache,
+                &options,
+                markdown,
+                Some(1),
+                None,
+                None,
+            );
+            let sc = scroll_cache(&mut cache, &source_id);
+            assert!(sc.page_size.is_some_and(|size| size.y > 0.0));
+            assert!(!sc.split_points.is_empty());
+            for (index, _, _) in &sc.split_points {
+                if let Some((event, _)) = sc.events.get(*index) {
+                    assert!(
+                        !matches!(event, Event::End(_)),
+                        "split resumed at an unmatched End event: {event:?}"
+                    );
+                }
+            }
+
+            CommonMarkViewerInternal::new().show_scrollable(
+                source_id,
+                ui,
+                &mut cache,
+                &options,
+                markdown,
+                Some(1),
+                None,
+                None,
+            );
         });
     }
 
