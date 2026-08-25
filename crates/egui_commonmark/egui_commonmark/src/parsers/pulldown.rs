@@ -249,8 +249,11 @@ fn table_cell_height(
     line_height: f32,
     cache: &CommonMarkCache,
     ui: &Ui,
+    column_width: f32,
 ) -> f32 {
-    let mut height = line_height * 1.5 * cell_visual_lines(cell) as f32;
+    let text = markdown_cell_text(cell);
+    let mut height = wrapped_text_height(ui, &text, column_width, line_height)
+        .max(line_height * 1.5 * cell_visual_lines(cell) as f32);
     for (event, _) in cell {
         if let pulldown_cmark::Event::InlineMath(_tex) = event {
             let conservative = line_height * 2.0;
@@ -269,16 +272,78 @@ fn table_cell_height(
     height
 }
 
-/// Heuristic visual-line count for an HTML-table cell (rendered as a plain
-/// `RichText` string, not as a markdown event stream). Counts explicit
-/// newlines and adds a crude wrap estimate of ~60 chars per visual line.
-/// Over-estimates slightly by design — extra row height is preferable to
-/// clipping. Exact estimation would require knowing the rendered column
-/// width up front, which TableBuilder doesn't expose before render.
-fn html_cell_visual_lines(cell: &str) -> usize {
-    let explicit_lines = cell.lines().count().max(1);
-    let wrap_est = cell.len().saturating_sub(1) / 60;
-    explicit_lines.saturating_add(wrap_est).max(1)
+fn markdown_cell_text(cell: &[(pulldown_cmark::Event, Range<usize>)]) -> String {
+    let mut text = String::new();
+    for (event, _) in cell {
+        match event {
+            pulldown_cmark::Event::Text(value)
+            | pulldown_cmark::Event::Code(value)
+            | pulldown_cmark::Event::InlineHtml(value)
+            | pulldown_cmark::Event::Html(value)
+            | pulldown_cmark::Event::FootnoteReference(value)
+            | pulldown_cmark::Event::InlineMath(value)
+            | pulldown_cmark::Event::DisplayMath(value) => text.push_str(value),
+            pulldown_cmark::Event::SoftBreak | pulldown_cmark::Event::HardBreak => text.push('\n'),
+            pulldown_cmark::Event::TaskListMarker(checked) => {
+                text.push_str(if *checked { "[x] " } else { "[ ] " });
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+fn natural_text_width(ui: &Ui, text: &str) -> f32 {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    text.lines()
+        .map(|line| {
+            ui.painter()
+                .layout_no_wrap(line.to_owned(), font_id.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max)
+        + 16.0
+}
+
+fn wrapped_text_height(ui: &Ui, text: &str, column_width: f32, line_height: f32) -> f32 {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let galley = ui.painter().layout(
+        text.to_owned(),
+        font_id,
+        egui::Color32::WHITE,
+        (column_width - 8.0).max(1.0),
+    );
+    line_height * 1.5 * galley.rows.len().max(1) as f32
+}
+
+/// Preserve naturally narrow columns while sharing the remaining width among
+/// wider columns. If even the minimum widths do not fit, horizontal scrolling
+/// remains available.
+fn fit_column_widths(desired: &[f32], available: f32, minimum: f32) -> Vec<f32> {
+    if desired.is_empty() {
+        return Vec::new();
+    }
+    let desired: Vec<f32> = desired.iter().map(|width| width.max(minimum)).collect();
+    if desired.iter().sum::<f32>() <= available {
+        return desired;
+    }
+    if available <= minimum * desired.len() as f32 {
+        return vec![minimum; desired.len()];
+    }
+
+    let mut low = minimum;
+    let mut high = desired.iter().copied().fold(minimum, f32::max);
+    for _ in 0..24 {
+        let cap = (low + high) * 0.5;
+        let total: f32 = desired.iter().map(|width| width.min(cap)).sum();
+        if total > available {
+            high = cap;
+        } else {
+            low = cap;
+        }
+    }
+    desired.into_iter().map(|width| width.min(low)).collect()
 }
 
 /// Redirect Shift+vertical-wheel over a hovered wide-table into its inner
@@ -1257,19 +1322,6 @@ impl CommonMarkViewerInternal {
                 return;
             }
             let cell_h = line_h * 1.5;
-            let header_h = header
-                .iter()
-                .map(|cell| table_cell_height(cell, line_h, cache, ui))
-                .fold(cell_h, f32::max);
-            let body_heights: Vec<f32> = rows
-                .iter()
-                .map(|row| {
-                    row
-                        .iter()
-                        .map(|cell| table_cell_height(cell, line_h, cache, ui))
-                        .fold(cell_h, f32::max)
-                })
-                .collect();
             // Outer ScrollArea::horizontal handles the case where columns
             // (auto-sized to content) total wider than the parent ui; without it,
             // narrow windows clip the rightmost columns. Plain vertical wheel
@@ -1288,6 +1340,23 @@ impl CommonMarkViewerInternal {
                 .table_max_width
                 .map(|w| w as f32)
                 .unwrap_or(max_width);
+            let mut table_rows = Vec::with_capacity(rows.len() + usize::from(!header.is_empty()));
+            if !header.is_empty() {
+                table_rows.push(header);
+            }
+            table_rows.extend(rows);
+            let desired_widths: Vec<f32> = (0..num_cols)
+                .map(|column| {
+                    table_rows
+                        .iter()
+                        .filter_map(|row| row.get(column))
+                        .map(|cell| natural_text_width(ui, &markdown_cell_text(cell)))
+                        .fold(40.0, f32::max)
+                })
+                .collect();
+            let column_space = ui.spacing().item_spacing.x * num_cols.saturating_sub(1) as f32;
+            let initial_widths =
+                fit_column_widths(&desired_widths, (table_bound - column_space).max(0.0), 40.0);
             // The document ui is allocated at the prose width, and a child ui
             // can never exceed its parent's allocation — so a wider viewport
             // must be carved out explicitly. egui does not clamp an explicit
@@ -1307,8 +1376,8 @@ impl CommonMarkViewerInternal {
                         .show(ui, |ui| {
                             ui.vertical(|ui| {
                                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                                    let table = egui_extras::TableBuilder::new(ui)
-                                        .id_salt(id)
+                                    let mut builder = egui_extras::TableBuilder::new(ui)
+                                        .id_salt(id.with("_wrapped"))
                                         .striped(true)
                                         .resizable(true)
                                         .vscroll(false)
@@ -1320,48 +1389,48 @@ impl CommonMarkViewerInternal {
                                         // max_width and provides horizontal scroll.
                                         .auto_shrink([true, true])
                                         .min_scrolled_height(0.0)
-                                        .cell_layout(egui::Layout::left_to_right(
-                                            egui::Align::Center,
-                                        ))
-                                        .columns(
-                                            egui_extras::Column::auto()
+                                        .cell_layout(egui::Layout::left_to_right(egui::Align::Min));
+                                    for width in initial_widths {
+                                        builder = builder.column(
+                                            egui_extras::Column::initial(width)
                                                 .resizable(true)
+                                                .clip(true)
                                                 .at_least(40.0),
-                                            num_cols,
-                                        )
-                                        .header(header_h, |mut row| {
-                                            for col in header {
-                                                row.col(|ui| {
-                                                    let col_w = ui.available_width();
-                                                    for (e, src_span) in col {
-                                                        let tmp_start = std::mem::replace(
-                                                            &mut self.line.should_start_newline,
-                                                            false,
-                                                        );
-                                                        let tmp_end = std::mem::replace(
-                                                            &mut self.line.should_end_newline,
-                                                            false,
-                                                        );
-                                                        self.event(
-                                                            ui, e, src_span, cache, options,
-                                                            col_w,
-                                                        );
-                                                        self.line.should_start_newline = tmp_start;
-                                                        self.line.should_end_newline = tmp_end;
-                                                    }
-                                                });
-                                            }
-                                        });
-                                    table.body(|mut body| {
-                                        for (row_idx, row) in rows.into_iter().enumerate() {
-                                            let h = body_heights
-                                                .get(row_idx)
-                                                .copied()
-                                                .unwrap_or(cell_h);
-                                            body.row(h, |mut row_ui| {
+                                        );
+                                    }
+                                    builder.body(|mut body| {
+                                        let widths = body.widths().to_vec();
+                                        let heights: Vec<f32> = {
+                                            let measure_ui = body.ui_mut();
+                                            table_rows
+                                                .iter()
+                                                .map(|row| {
+                                                    row.iter()
+                                                        .enumerate()
+                                                        .map(|(column, cell)| {
+                                                            table_cell_height(
+                                                                cell,
+                                                                line_h,
+                                                                cache,
+                                                                measure_ui,
+                                                                widths
+                                                                    .get(column)
+                                                                    .copied()
+                                                                    .unwrap_or(40.0),
+                                                            )
+                                                        })
+                                                        .fold(cell_h, f32::max)
+                                                })
+                                                .collect()
+                                        };
+                                        body.heterogeneous_rows(heights.into_iter(), |mut row_ui| {
+                                            let row = &table_rows[row_ui.index()];
                                                 for col in row {
                                                     row_ui.col(|ui| {
-                                                        let col_w = ui.available_width();
+                                                        ui.style_mut().wrap_mode =
+                                                            Some(egui::TextWrapMode::Wrap);
+                                                        let col_w = ui.max_rect().width();
+                                                        ui.set_width(col_w);
                                                         for (e, src_span) in col {
                                                             let tmp_start = std::mem::replace(
                                                                 &mut self.line.should_start_newline,
@@ -1372,7 +1441,11 @@ impl CommonMarkViewerInternal {
                                                                 false,
                                                             );
                                                             self.event(
-                                                                ui, e, src_span, cache, options,
+                                                                ui,
+                                                                e.clone(),
+                                                                src_span.clone(),
+                                                                cache,
+                                                                options,
                                                                 col_w,
                                                             );
                                                             self.line.should_start_newline =
@@ -1381,8 +1454,7 @@ impl CommonMarkViewerInternal {
                                                         }
                                                     });
                                                 }
-                                            });
-                                        }
+                                        });
                                     });
                                 });
                             });
@@ -1602,6 +1674,8 @@ impl CommonMarkViewerInternal {
                 .push_str(raw_heading_text.unwrap_or(&text));
             // Accumulate RichText - will render all at once in end_tag(Heading)
             self.current_heading_rich_texts.push(rich_text);
+        } else if self.is_table {
+            ui.add(egui::Label::new(rich_text).wrap());
         } else {
             ui.label(rich_text);
         }
@@ -2092,30 +2166,6 @@ impl CommonMarkViewerInternal {
             return;
         }
 
-        // Heuristic per-row heights: count explicit newlines + crude wrap est at
-        // ~60 chars/visual-line. Over-estimates slightly (extra row height is
-        // preferable to clipping). Header rows use the same heuristic.
-        let row_height_for = |cells: &[String]| -> f32 {
-            let max_lines = cells
-                .iter()
-                .map(|c| html_cell_visual_lines(c))
-                .max()
-                .unwrap_or(1);
-            cell_h * max_lines as f32
-        };
-        let header_h = table
-            .header
-            .first()
-            .map(|row| row_height_for(row))
-            .unwrap_or(cell_h);
-        let extra_header_heights: Vec<f32> = table
-            .header
-            .iter()
-            .skip(1)
-            .map(|row| row_height_for(row))
-            .collect();
-        let body_heights: Vec<f32> = table.rows.iter().map(|row| row_height_for(row)).collect();
-
         // Outer ScrollArea::horizontal handles wide tables that exceed parent width;
         // ui.vertical() prevents the header/body Y-overlap quirk. Plain vertical wheel
         // stays with the outer document scroller (#22); Shift+wheel opts in to
@@ -2125,6 +2175,24 @@ impl CommonMarkViewerInternal {
             .table_max_width
             .map(|w| w as f32)
             .unwrap_or(max_width);
+        let table_rows: Vec<(bool, &[String])> = table
+            .header
+            .iter()
+            .map(|row| (true, row.as_slice()))
+            .chain(table.rows.iter().map(|row| (false, row.as_slice())))
+            .collect();
+        let desired_widths: Vec<f32> = (0..num_cols)
+            .map(|column| {
+                table_rows
+                    .iter()
+                    .filter_map(|(_, row)| row.get(column))
+                    .map(|cell| natural_text_width(ui, cell))
+                    .fold(40.0, f32::max)
+            })
+            .collect();
+        let column_space = ui.spacing().item_spacing.x * num_cols.saturating_sub(1) as f32;
+        let initial_widths =
+            fit_column_widths(&desired_widths, (table_bound - column_space).max(0.0), 40.0);
         // Same reading-column escape as markdown tables (#64): carve out a
         // scope wider than the prose allocation, anchored at the cursor.
         let mut table_scope_rect = ui.cursor();
@@ -2139,8 +2207,8 @@ impl CommonMarkViewerInternal {
                     .show(ui, |ui| {
                 ui.vertical(|ui| {
                     egui::Frame::group(ui.style()).show(ui, |ui| {
-                        let builder = egui_extras::TableBuilder::new(ui)
-                            .id_salt(id)
+                        let mut builder = egui_extras::TableBuilder::new(ui)
+                            .id_salt(id.with("_wrapped"))
                             .striped(true)
                             .resizable(true)
                             .vscroll(false)
@@ -2148,11 +2216,15 @@ impl CommonMarkViewerInternal {
                             // outer ScrollArea still handles wide-table overflow.
                             .auto_shrink([true, true])
                             .min_scrolled_height(0.0)
-                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                            .columns(
-                                egui_extras::Column::auto().resizable(true).at_least(40.0),
-                                num_cols,
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Min));
+                        for width in initial_widths {
+                            builder = builder.column(
+                                egui_extras::Column::initial(width)
+                                    .resizable(true)
+                                    .clip(true)
+                                    .at_least(40.0),
                             );
+                        }
 
                         let render_cell_strong = |ui: &mut Ui, cell: &str| {
                             egui::Frame::NONE
@@ -2162,82 +2234,49 @@ impl CommonMarkViewerInternal {
                                 });
                         };
 
-                        if let Some(first_header) = table.header.first() {
-                            builder
-                                .header(header_h, |mut row| {
-                                    for cell in first_header {
-                                        row.col(|ui| render_cell_strong(ui, cell));
-                                    }
-                                })
-                                .body(|mut body| {
-                                    // Extra header rows after the first render as bold
-                                    // body rows (TableBuilder has only one native header row).
-                                    for (idx, extra) in table.header.iter().skip(1).enumerate() {
-                                        let h = extra_header_heights
-                                            .get(idx)
-                                            .copied()
-                                            .unwrap_or(cell_h);
-                                        body.row(h, |mut row_ui| {
-                                            for cell in extra {
-                                                row_ui.col(|ui| render_cell_strong(ui, cell));
-                                            }
-                                        });
-                                    }
-                                    for (row_idx, row) in table.rows.iter().enumerate() {
-                                        let h = body_heights
-                                            .get(row_idx)
-                                            .copied()
-                                            .unwrap_or(cell_h);
-                                        body.row(h, |mut row_ui| {
-                                            for cell in row {
-                                                row_ui.col(|ui| {
-                                                    egui::Frame::NONE
-                                                        .inner_margin(egui::Margin::symmetric(
-                                                            8, 4,
-                                                        ))
-                                                        .show(ui, |ui| {
-                                                            let rich_text = self
-                                                                .text_style
-                                                                .to_richtext_with_options(
-                                                                    ui,
-                                                                    cell,
-                                                                    options,
-                                                                );
-                                                            ui.label(rich_text);
-                                                        });
+                        builder.body(|mut body| {
+                            let widths = body.widths().to_vec();
+                            let heights: Vec<f32> = {
+                                let measure_ui = body.ui_mut();
+                                table_rows
+                                    .iter()
+                                    .map(|(_, row)| {
+                                        row.iter()
+                                            .enumerate()
+                                            .map(|(column, cell)| {
+                                                wrapped_text_height(
+                                                    measure_ui,
+                                                    cell,
+                                                    widths.get(column).copied().unwrap_or(40.0)
+                                                        - 16.0,
+                                                    line_h,
+                                                ) + 8.0
+                                            })
+                                            .fold(cell_h, f32::max)
+                                    })
+                                    .collect()
+                            };
+                            body.heterogeneous_rows(heights.into_iter(), |mut row_ui| {
+                                let (is_header, row) = table_rows[row_ui.index()];
+                                for cell in row {
+                                    row_ui.col(|ui| {
+                                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                        if is_header {
+                                            render_cell_strong(ui, cell);
+                                        } else {
+                                            egui::Frame::NONE
+                                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                                .show(ui, |ui| {
+                                                    let rich_text = self
+                                                        .text_style
+                                                        .to_richtext_with_options(ui, cell, options);
+                                                    ui.label(rich_text);
                                                 });
-                                            }
-                                        });
-                                    }
-                                });
-                        } else {
-                            builder.body(|mut body| {
-                                for (row_idx, row) in table.rows.iter().enumerate() {
-                                    let h = body_heights
-                                        .get(row_idx)
-                                        .copied()
-                                        .unwrap_or(cell_h);
-                                    body.row(h, |mut row_ui| {
-                                        for cell in row {
-                                            row_ui.col(|ui| {
-                                                egui::Frame::NONE
-                                                    .inner_margin(egui::Margin::symmetric(8, 4))
-                                                    .show(ui, |ui| {
-                                                        let rich_text = self
-                                                            .text_style
-                                                            .to_richtext_with_options(
-                                                                ui,
-                                                                cell,
-                                                                options,
-                                                            );
-                                                        ui.label(rich_text);
-                                                    });
-                                            });
                                         }
                                     });
                                 }
                             });
-                        }
+                        });
                     });
                 });
             });
@@ -2315,8 +2354,27 @@ mod tests {
             let line_height = ui.text_style_height(&egui::TextStyle::Body);
             let cell = vec![(Event::InlineMath(r"\frac{a}{b}".into()), 0..11)];
 
-            assert!(table_cell_height(&cell, line_height, &cache, ui) >= line_height * 2.0);
+            assert!(
+                table_cell_height(&cell, line_height, &cache, ui, 120.0) >= line_height * 2.0
+            );
         });
+    }
+
+    #[test]
+    fn fitted_table_columns_preserve_narrow_content() {
+        let widths = fit_column_widths(&[60.0, 500.0, 120.0], 360.0, 40.0);
+        assert!((widths[0] - 60.0).abs() < 0.1);
+        assert!((widths[2] - 120.0).abs() < 0.1);
+        assert!((widths.iter().sum::<f32>() - 360.0).abs() < 0.1);
+        assert!(widths[1] > widths[2]);
+    }
+
+    #[test]
+    fn fitted_table_columns_keep_minimum_for_horizontal_overflow() {
+        assert_eq!(
+            fit_column_widths(&[100.0, 200.0, 300.0], 100.0, 40.0),
+            vec![40.0; 3]
+        );
     }
 
     #[test]

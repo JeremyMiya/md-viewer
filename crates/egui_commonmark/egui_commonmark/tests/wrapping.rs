@@ -57,7 +57,10 @@ fn render_geometry_with_hooks(
         ctx.begin_pass(Default::default());
         egui::CentralPanel::default().show(&ctx, |ui| {
             ui.set_width(width);
-            let response = CommonMarkViewer::new().show(ui, &mut cache, markdown);
+            let response = CommonMarkViewer::new()
+                .default_width(Some(width as usize))
+                .table_max_width(Some(width as usize))
+                .show(ui, &mut cache, markdown);
             body_rect = response.response.rect;
         });
         let output = ctx.end_pass();
@@ -143,6 +146,34 @@ fn long_inline_code_path_keeps_clickable_link_styling_after_wrapping() {
         .collect();
 
     assert_eq!(linked_text, path, "painted text: {painted:#?}");
+}
+
+#[test]
+fn long_markdown_table_text_wraps_and_expands_its_row() {
+    let prose = "WRAPPED_MARKDOWN_CELL ".repeat(18);
+    let markdown = format!(
+        "| Key | Description |\n|---|---|\n| signal | {prose} |\n\nAFTER_MARKDOWN_TABLE"
+    );
+    let (_, row_height, painted) = render_geometry(&markdown, 360.0);
+    let cell = text_rect(&painted, "WRAPPED_MARKDOWN_CELL");
+    let after = text_rect(&painted, "AFTER_MARKDOWN_TABLE");
+
+    assert!(cell.height() > row_height * 1.5, "cell did not wrap: {cell:?}");
+    assert!(cell.bottom() <= after.top(), "wrapped row clipped/overlapped: {cell:?} {after:?}");
+}
+
+#[test]
+fn long_html_table_text_wraps_and_expands_its_row() {
+    let prose = "WRAPPED_HTML_CELL ".repeat(18);
+    let markdown = format!(
+        "<table><tr><th>Key</th><th>Description</th></tr><tr><td>signal</td><td>{prose}</td></tr></table>\n\nAFTER_HTML_TABLE"
+    );
+    let (_, row_height, painted) = render_geometry(&markdown, 360.0);
+    let cell = text_rect(&painted, "WRAPPED_HTML_CELL");
+    let after = text_rect(&painted, "AFTER_HTML_TABLE");
+
+    assert!(cell.height() > row_height * 1.5, "cell did not wrap: {cell:?}");
+    assert!(cell.bottom() <= after.top(), "wrapped row clipped/overlapped: {cell:?} {after:?}");
 }
 
 // ---------------------------------------------------------------------------
