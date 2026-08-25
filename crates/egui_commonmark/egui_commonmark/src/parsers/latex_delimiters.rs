@@ -29,6 +29,7 @@ use std::ops::Range;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Rewrite {
     at: usize,
+    original_len: usize,
     replacement: &'static str,
 }
 
@@ -234,10 +235,29 @@ fn scan_run(text: &str, run: Range<usize>, out: &mut Vec<Rewrite>) {
         }) {
             out.push(Rewrite {
                 at: open_at,
+                original_len: 2,
                 replacement: kind.replacement(),
             });
+            // CommonMark recognizes table separators before it recognizes math.
+            // Hide bare absolute-value bars inside a completed LaTeX-style pair
+            // from the table parser; the math backend decodes the entity again.
+            for bar in open_at + 2..i {
+                let preceding_slashes = bytes[..bar]
+                    .iter()
+                    .rev()
+                    .take_while(|&&byte| byte == b'\\')
+                    .count();
+                if bytes[bar] == b'|' && preceding_slashes % 2 == 0 {
+                    out.push(Rewrite {
+                        at: bar,
+                        original_len: 1,
+                        replacement: "&#124;",
+                    });
+                }
+            }
             out.push(Rewrite {
                 at: i,
+                original_len: 2,
                 replacement: kind.replacement(),
             });
             pending = None;
@@ -256,9 +276,9 @@ fn build_normalized<'a>(text: &'a str, rewrites: &[Rewrite]) -> (String, OffsetM
     for rw in rewrites {
         out.push_str(&text[prev..rw.at]);
         out.push_str(rw.replacement);
-        delta += 2i64 - rw.replacement.len() as i64;
+        delta += rw.original_len as i64 - rw.replacement.len() as i64;
         shifts.push((out.len(), delta));
-        prev = rw.at + 2;
+        prev = rw.at + rw.original_len;
     }
     out.push_str(&text[prev..]);
     (out, OffsetMap { shifts })
@@ -306,6 +326,35 @@ mod tests {
     }
 
     #[test]
+    fn table_formula_keeps_command_before_closing_delimiter() {
+        let text = concat!(
+            "| formula |\n|---|\n",
+            r"| \(D_t+\epsilon\) |",
+            "\n",
+            r"| \(a_t/(D_t^{opp}+\epsilon)\) |",
+            "\n",
+        );
+        let formulas: Vec<_> = parse_events(text, true)
+            .into_iter()
+            .filter_map(|(event, range)| match event {
+                Event::InlineMath(tex) => Some((tex.into_string(), text[range].to_string())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            formulas,
+            [
+                (r"D_t+\epsilon".into(), r"\(D_t+\epsilon\)".into()),
+                (
+                    r"a_t/(D_t^{opp}+\epsilon)".into(),
+                    r"\(a_t/(D_t^{opp}+\epsilon)\)".into(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn display_pair_across_lines_converts() {
         let text = "\\[\nr_a=1\n\\]";
         let (event, slice) =
@@ -330,6 +379,32 @@ mod tests {
         assert_eq!(display.len(), 1);
         assert!(inline.iter().any(|(_, s)| s == "$a$"));
         assert!(inline.iter().any(|(_, s)| s == "\\(b\\)"));
+    }
+
+    #[test]
+    fn absolute_value_bars_do_not_split_markdown_table_cells() {
+        let text = concat!(
+            "| name | formula | kind |\n",
+            "|---|---|---|\n",
+            r"| first | \(\operatorname{EW}[|\Delta OI|]\) | native |",
+            "\n",
+        );
+        let events = parse_events(text, true);
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(event, _)| matches!(event, Event::Start(Tag::TableCell)))
+                .count(),
+            6
+        );
+        let formula = events.iter().find_map(|(event, range)| match event {
+            Event::InlineMath(tex) => Some((tex.as_ref(), range.clone())),
+            _ => None,
+        });
+        let (formula, range) = formula.expect("inline formula");
+        assert_eq!(formula, r"\operatorname{EW}[&#124;\Delta OI&#124;]");
+        assert_eq!(&text[range], r"\(\operatorname{EW}[|\Delta OI|]\)");
     }
 
     #[test]

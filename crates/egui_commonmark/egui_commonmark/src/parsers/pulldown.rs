@@ -244,6 +244,31 @@ fn cell_visual_lines(cell: &[(pulldown_cmark::Event, Range<usize>)]) -> usize {
     max_lines
 }
 
+fn table_cell_height(
+    cell: &[(pulldown_cmark::Event, Range<usize>)],
+    line_height: f32,
+    cache: &CommonMarkCache,
+    ui: &Ui,
+) -> f32 {
+    let mut height = line_height * 1.5 * cell_visual_lines(cell) as f32;
+    for (event, _) in cell {
+        if let pulldown_cmark::Event::InlineMath(_tex) = event {
+            let conservative = line_height * 2.0;
+            #[cfg(feature = "math")]
+            let formula_height = crate::cached_inline_math_height(ui, cache, _tex)
+                .map(|exact| exact + line_height * 0.5)
+                .unwrap_or(conservative);
+            #[cfg(not(feature = "math"))]
+            let formula_height = {
+                let _ = (cache, ui);
+                conservative
+            };
+            height = height.max(formula_height);
+        }
+    }
+    height
+}
+
 /// Heuristic visual-line count for an HTML-table cell (rendered as a plain
 /// `RichText` string, not as a markdown event stream). Counts explicit
 /// newlines and adds a crude wrap estimate of ~60 chars per visual line.
@@ -376,14 +401,10 @@ pub struct CommonMarkViewerInternal {
 
     /// Track current heading for position recording
     current_heading_y: Option<f32>,
+    current_heading_source_start: Option<usize>,
     current_heading_text: String,
     /// Accumulate heading RichText fragments for single render at end
     current_heading_rich_texts: Vec<egui::RichText>,
-    /// Per-render-pass counter: number of headings seen so far with each
-    /// normalized title. Used to build composite cache keys that
-    /// disambiguate duplicate-titled headers (e.g. multiple `## Installation`).
-    /// Reset at the start of each `show*` call so the count restarts at 0.
-    heading_occurrence_counts: std::collections::HashMap<String, usize>,
 }
 
 pub(crate) struct CheckboxClickEvent {
@@ -409,9 +430,9 @@ impl CommonMarkViewerInternal {
             is_blockquote: false,
             checkbox_events: Vec::new(),
             current_heading_y: None,
+            current_heading_source_start: None,
             current_heading_text: String::new(),
             current_heading_rich_texts: Vec::new(),
-            heading_occurrence_counts: std::collections::HashMap::new(),
         }
     }
 }
@@ -1235,26 +1256,18 @@ impl CommonMarkViewerInternal {
                 self.line.try_insert_end(ui);
                 return;
             }
-            // Per-line cell height; rows grow taller when cells contain multi-chunk
-            // inline-code wraps (computed below via `cell_visual_lines`).
             let cell_h = line_h * 1.5;
-            // Header is one row; its height grows if any header cell has wrapped code.
-            let header_lines = header
+            let header_h = header
                 .iter()
-                .map(|c| cell_visual_lines(c))
-                .max()
-                .unwrap_or(1);
-            let header_h = cell_h * header_lines as f32;
-            // Pre-compute per-body-row height so multi-chunk cells aren't clipped.
+                .map(|cell| table_cell_height(cell, line_h, cache, ui))
+                .fold(cell_h, f32::max);
             let body_heights: Vec<f32> = rows
                 .iter()
                 .map(|row| {
-                    let max_lines = row
+                    row
                         .iter()
-                        .map(|c| cell_visual_lines(c))
-                        .max()
-                        .unwrap_or(1);
-                    cell_h * max_lines as f32
+                        .map(|cell| table_cell_height(cell, line_h, cache, ui))
+                        .fold(cell_h, f32::max)
                 })
                 .collect();
             // Outer ScrollArea::horizontal handles the case where columns
@@ -1397,7 +1410,9 @@ impl CommonMarkViewerInternal {
         max_width: f32,
     ) {
         match event {
-            pulldown_cmark::Event::Start(tag) => self.start_tag(ui, tag, options),
+            pulldown_cmark::Event::Start(tag) => {
+                self.start_tag(ui, tag, src_span.start, options)
+            }
             pulldown_cmark::Event::End(tag) => self.end_tag(ui, tag, cache, options, max_width),
             pulldown_cmark::Event::Text(text) => {
                 self.event_text_with_highlights(text, &src_span, cache, ui, options);
@@ -1500,7 +1515,11 @@ impl CommonMarkViewerInternal {
                 } else {
                     #[cfg(feature = "math")]
                     {
-                        crate::render_math(ui, cache, &tex, true);
+                        if self.is_table {
+                            crate::render_math_in_table(ui, cache, &tex);
+                        } else {
+                            crate::render_math(ui, cache, &tex, true);
+                        }
                     }
                     #[cfg(not(feature = "math"))]
                     if let Some(math_fn) = options.math_fn {
@@ -1579,7 +1598,6 @@ impl CommonMarkViewerInternal {
         } else if let Some(link) = &mut self.link {
             link.text.push(rich_text);
         } else if self.text_style.heading.is_some() {
-            // Accumulate heading text for position tracking
             self.current_heading_text
                 .push_str(raw_heading_text.unwrap_or(&text));
             // Accumulate RichText - will render all at once in end_tag(Heading)
@@ -1732,7 +1750,13 @@ impl CommonMarkViewerInternal {
         }
     }
 
-    fn start_tag(&mut self, ui: &mut Ui, tag: pulldown_cmark::Tag, options: &CommonMarkOptions) {
+    fn start_tag(
+        &mut self,
+        ui: &mut Ui,
+        tag: pulldown_cmark::Tag,
+        source_start: usize,
+        options: &CommonMarkOptions,
+    ) {
         match tag {
             pulldown_cmark::Tag::Paragraph => {
                 self.line.try_insert_start(ui);
@@ -1742,6 +1766,7 @@ impl CommonMarkViewerInternal {
                 ui.end_row();
                 // Record position BEFORE spacing for scroll navigation
                 self.current_heading_y = Some(ui.cursor().top());
+                self.current_heading_source_start = Some(source_start);
                 self.current_heading_text.clear();
                 // Add extra spacing above headings if configured
                 heading_start_spacing(ui, &options.typography);
@@ -1889,24 +1914,12 @@ impl CommonMarkViewerInternal {
                         }
                     });
                 }
-                // Record header position for scroll navigation. Composite key
-                // is `normalized_title` for the 0th occurrence and
-                // `normalized_title#N` for the Nth duplicate (matches the key
-                // built by the app's `header_position_key` helper), so multiple
-                // headings with the same title get distinct cache entries.
+                // Record under a source-stable key shared with the Outline parser.
                 if let Some(y) = self.current_heading_y.take() {
-                    if !self.current_heading_text.is_empty() {
-                        let normalized = self.current_heading_text.trim().to_lowercase();
-                        let nth = self
-                            .heading_occurrence_counts
-                            .entry(normalized.clone())
-                            .or_insert(0);
-                        let key = if *nth == 0 {
-                            normalized.clone()
-                        } else {
-                            format!("{normalized}#{nth}")
-                        };
-                        *nth += 1;
+                    if let Some(source_start) = self.current_heading_source_start.take() {
+                        let key = egui_commonmark_backend_extended::misc::header_position_key(
+                            source_start,
+                        );
                         // `y` (== `ui.cursor().top()` at heading start) is a
                         // SCREEN-y coordinate. The click handler uses the
                         // cached value with `ScrollArea::vertical_scroll_offset(N)`,
@@ -1945,6 +1958,7 @@ impl CommonMarkViewerInternal {
                         cache.record_header_content_y(&key, content_y);
                     }
                 }
+                self.current_heading_source_start = None;
                 self.current_heading_text.clear();
                 // Add extra spacing below headings if configured
                 heading_end_spacing(ui, &options.typography);
@@ -2295,6 +2309,17 @@ mod tests {
     }
 
     #[test]
+    fn table_cells_reserve_extra_height_for_inline_math() {
+        egui::__run_test_ui(|ui| {
+            let cache = CommonMarkCache::default();
+            let line_height = ui.text_style_height(&egui::TextStyle::Body);
+            let cell = vec![(Event::InlineMath(r"\frac{a}{b}".into()), 0..11)];
+
+            assert!(table_cell_height(&cell, line_height, &cache, ui) >= line_height * 2.0);
+        });
+    }
+
+    #[test]
     fn registered_markdown_paths_are_detected_as_auto_links() {
         let hooks = std::collections::HashMap::from([
             ("docs/guide.md".to_string(), false),
@@ -2582,14 +2607,14 @@ mod tests {
     }
 
     #[test]
-    fn production_duplicate_shortcode_headings_use_raw_occurrence_keys() {
+    fn production_duplicate_shortcode_headings_use_source_keys() {
         // Run complete heading start/text/end production events twice against one cache.
         egui::__run_test_ui(|ui| {
             let mut renderer = CommonMarkViewerInternal::new();
             let mut cache = CommonMarkCache::default();
             let options = CommonMarkOptions::default();
 
-            for _ in 0..2 {
+            for source_start in [0, 20] {
                 renderer.start_tag(
                     ui,
                     Tag::Heading {
@@ -2598,6 +2623,7 @@ mod tests {
                         classes: Vec::new(),
                         attrs: Vec::new(),
                     },
+                    source_start,
                     &options,
                 );
                 renderer.event(
@@ -2617,10 +2643,8 @@ mod tests {
                 );
             }
 
-            assert!(cache.get_header_position("pin :pushpin:").is_some());
-            assert!(cache.get_header_position("pin :pushpin:#1").is_some());
-            assert!(cache.get_header_position("pin 📌").is_none());
-            assert!(cache.get_header_position("pin 📌#1").is_none());
+            assert!(cache.get_header_position("heading-source:0").is_some());
+            assert!(cache.get_header_position("heading-source:20").is_some());
         });
     }
 

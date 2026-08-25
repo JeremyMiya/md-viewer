@@ -4,17 +4,19 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
-use egui_commonmark_extended::{CommonMarkCache, CommonMarkViewer};
+use egui_commonmark_extended::{header_position_key, CommonMarkCache, CommonMarkViewer};
 use notify::{PollWatcher, RecommendedWatcher};
 use notify_debouncer_mini::{new_debouncer, new_debouncer_opt, DebouncedEventKind, Debouncer};
 use regex::Regex;
@@ -32,11 +34,12 @@ const APP_KEY: &str = "md-viewer-state";
 const RECENT_FILES_CAP: usize = 20;
 const RECENT_SHOWN: usize = 6;
 
-/// Compiled regex for parsing markdown headers (lazy, compiled once)
-static HEADER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(#{1,6})\s+(.+)$").unwrap());
-
 const MAX_WATCHER_RETRIES: u32 = 3;
 const FLASH_DURATION_MS: u64 = 600;
+
+fn next_watcher_retry(current: u32) -> Option<u32> {
+    (current < MAX_WATCHER_RETRIES).then(|| current + 1)
+}
 
 // Optimal widths for initial window sizing (based on typography research)
 // Content: 600px optimal for 55-75 CPL readability
@@ -48,6 +51,10 @@ const EXPLORER_DEFAULT_WIDTH: f32 = 216.0; // 200 + 16 margins
 const OUTLINE_DEFAULT_WIDTH: f32 = 208.0; // 200 + 8 margins
 const PANEL_SEPARATORS: f32 = 16.0;
 const OPTIMAL_WINDOW_HEIGHT: f32 = 750.0;
+const SIDEBAR_MIN_WIDTH: f32 = 70.0;
+const SIDEBAR_RESIZE_GRAB_RADIUS: f32 = 8.0;
+const EXPLORER_RIGHT_RESIZE_GUTTER: i8 = 12;
+const CONTENT_RIGHT_RESIZE_GUTTER: i8 = 10;
 
 // Keyboard document scroll deltas are centralized so shortcut wiring and tests
 // share the same line/page behavior.
@@ -88,6 +95,222 @@ fn content_default_width(full_width_content: bool) -> Option<usize> {
         None
     } else {
         Some(CONTENT_OPTIMAL_WIDTH as usize)
+    }
+}
+
+/// Check whether the desktop portal exposes the interface used by rfd's
+/// Linux folder picker. Calling rfd without this interface fails like a user
+/// cancellation, so checking first lets us distinguish that case and use a
+/// local fallback without opening a second dialog after a real cancellation.
+#[cfg(target_os = "linux")]
+fn portal_file_chooser_available() -> bool {
+    Command::new("gdbus")
+        .args([
+            "introspect",
+            "--session",
+            "--dest",
+            "org.freedesktop.portal.Desktop",
+            "--object-path",
+            "/org/freedesktop/portal/desktop",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| {
+            output.status.success() && portal_introspection_has_file_chooser(&output.stdout)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn portal_introspection_has_file_chooser(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout).contains("org.freedesktop.portal.FileChooser")
+}
+
+#[cfg(target_os = "linux")]
+fn path_from_picker_output(stdout: Vec<u8>) -> Option<PathBuf> {
+    if stdout.is_empty() {
+        None
+    } else {
+        // Python writes os.fsencode(path), so preserve arbitrary Unix path
+        // bytes rather than requiring the selected directory to be UTF-8.
+        Some(PathBuf::from(OsString::from_vec(stdout)))
+    }
+}
+
+/// Use Python's standard-library Tk binding as a no-install file picker on
+/// Linux desktops where xdg-desktop-portal is not installed.
+#[cfg(target_os = "linux")]
+fn pick_file_with_tkinter(initial_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    const SCRIPT: &str = r#"
+import os
+import sys
+import tkinter as tk
+from tkinter import filedialog
+
+root = tk.Tk()
+root.withdraw()
+try:
+    options = {
+        "title": "Open Markdown File",
+        "parent": root,
+        "filetypes": [
+            ("Markdown", ("*.md", "*.markdown")),
+            ("Text", "*.txt"),
+            ("All Files", "*"),
+        ],
+    }
+    if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
+        options["initialdir"] = sys.argv[1]
+    selected = filedialog.askopenfilename(**options)
+    if selected:
+        sys.stdout.buffer.write(os.fsencode(selected))
+finally:
+    root.destroy()
+"#;
+
+    let mut command = Command::new("python3");
+    command
+        .arg("-c")
+        .arg(SCRIPT)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped());
+    if let Some(directory) = initial_dir.filter(|path| path.is_dir()) {
+        command.arg(directory);
+    }
+
+    let output = command
+        .output()
+        .map_err(|error| format!("Tkinter file picker could not start: {error}"))?;
+
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if details.is_empty() {
+            "Tkinter file picker exited with an error".to_string()
+        } else {
+            format!("Tkinter file picker failed: {details}")
+        });
+    }
+
+    let selected = path_from_picker_output(output.stdout);
+    if let Some(path) = &selected {
+        if !path.is_file() {
+            return Err(format!(
+                "File picker returned a file that does not exist: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(selected)
+}
+
+fn pick_file(initial_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let mut dialog = rfd::FileDialog::new()
+        .add_filter("Markdown", &["md", "markdown"])
+        .add_filter("Text", &["txt"])
+        .add_filter("All Files", &["*"]);
+    if let Some(directory) = initial_dir.filter(|path| path.is_dir()) {
+        dialog = dialog.set_directory(directory);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if portal_file_chooser_available() {
+            return Ok(dialog.pick_file());
+        }
+
+        log::info!("XDG Desktop Portal FileChooser is unavailable; using the Tkinter file picker");
+        pick_file_with_tkinter(initial_dir)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(dialog.pick_file())
+    }
+}
+
+/// Use Python's standard-library Tk binding as a no-install folder picker on
+/// Linux desktops where xdg-desktop-portal is not installed. The initial
+/// directory is passed as a process argument, never interpolated into Python.
+#[cfg(target_os = "linux")]
+fn pick_folder_with_tkinter(initial_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    const SCRIPT: &str = r#"
+import os
+import sys
+import tkinter as tk
+from tkinter import filedialog
+
+root = tk.Tk()
+root.withdraw()
+try:
+    options = {"title": "Open Folder", "mustexist": True, "parent": root}
+    if len(sys.argv) > 1 and os.path.isdir(sys.argv[1]):
+        options["initialdir"] = sys.argv[1]
+    selected = filedialog.askdirectory(**options)
+    if selected:
+        sys.stdout.buffer.write(os.fsencode(selected))
+finally:
+    root.destroy()
+"#;
+
+    let mut command = Command::new("python3");
+    command
+        .arg("-c")
+        .arg(SCRIPT)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped());
+    if let Some(directory) = initial_dir.filter(|path| path.is_dir()) {
+        command.arg(directory);
+    }
+
+    let output = command
+        .output()
+        .map_err(|error| format!("Tkinter folder picker could not start: {error}"))?;
+
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if details.is_empty() {
+            "Tkinter folder picker exited with an error".to_string()
+        } else {
+            format!("Tkinter folder picker failed: {details}")
+        });
+    }
+
+    let selected = path_from_picker_output(output.stdout);
+    if let Some(path) = &selected {
+        if !path.is_dir() {
+            return Err(format!(
+                "Folder picker returned a directory that does not exist: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(selected)
+}
+
+fn pick_folder(initial_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(directory) = initial_dir.filter(|path| path.is_dir()) {
+        dialog = dialog.set_directory(directory);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if portal_file_chooser_available() {
+            return Ok(dialog.pick_folder());
+        }
+
+        log::info!(
+            "XDG Desktop Portal FileChooser is unavailable; using the Tkinter folder picker"
+        );
+        pick_folder_with_tkinter(initial_dir)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(dialog.pick_folder())
     }
 }
 
@@ -154,21 +377,16 @@ struct PersistedState {
     explorer_root: Option<PathBuf>,
     expanded_dirs: Option<Vec<PathBuf>>,
     explorer_sort_order: Option<SortOrder>,
+    explorer_width: Option<f32>,
+    outline_width: Option<f32>,
     recent_files: Option<Vec<RecentEntry>>,
 }
 
-/// Build the composite cache key for a header position lookup. Combines the
-/// normalized (lowercased) title with the occurrence index so duplicate-titled
-/// headers map to distinct entries in `CommonMarkCache::header_positions`.
-/// Both the parser (which assigns `nth_with_same_text` to each `Header`) and
-/// the renderer (which records positions while painting) use this function so
-/// keys agree across the read/write boundary.
-pub fn header_position_key(normalized_title: &str, nth_with_same_text: usize) -> String {
-    if nth_with_same_text == 0 {
-        normalized_title.to_string()
-    } else {
-        format!("{normalized_title}#{nth_with_same_text}")
-    }
+fn restored_sidebar_width(width: Option<f32>, default: f32) -> f32 {
+    width
+        .filter(|width| width.is_finite())
+        .map(|width| width.max(SIDEBAR_MIN_WIDTH))
+        .unwrap_or(default)
 }
 
 /// Represents a markdown header for the outline
@@ -176,15 +394,11 @@ pub fn header_position_key(normalized_title: &str, nth_with_same_text: usize) ->
 struct Header {
     level: u8,
     title: String,
-    /// Pre-computed truncated display title for outline sidebar
+    /// Pre-computed truncated display title for outline sidebar.
     display_title: String,
-    /// Pre-computed lowercase key for header position cache lookups
-    normalized_title: String,
-    /// Occurrence index among headers with the same `normalized_title`.
-    /// The first `## Installation` is 0, the second is 1, etc. Combined
-    /// with `normalized_title` into the composite cache key so duplicates
-    /// scroll to the correct (different) y positions.
-    nth_with_same_text: usize,
+    /// Byte offset of the heading's Start event. The renderer records the
+    /// position under the same source-stable key, independent of formatting.
+    source_start: usize,
     line_number: usize,
 }
 
@@ -266,13 +480,11 @@ enum FileTreeNode {
     File {
         path: PathBuf,
         name: String,
-        display_name: String,
         modified: Option<std::time::SystemTime>,
     },
     Directory {
         path: PathBuf,
         name: String,
-        display_name: String,
         modified: Option<std::time::SystemTime>,
         /// None = not yet loaded, Some = loaded (may be empty)
         children: Option<Vec<FileTreeNode>>,
@@ -299,6 +511,12 @@ impl FileTreeNode {
     }
 }
 
+struct ExplorerScanResult {
+    root: PathBuf,
+    sort_order: SortOrder,
+    tree: Vec<FileTreeNode>,
+}
+
 /// File explorer state
 #[derive(Default)]
 struct FileExplorer {
@@ -306,8 +524,8 @@ struct FileExplorer {
     tree: Vec<FileTreeNode>,
     expanded_dirs: HashSet<PathBuf>,
     sort_order: SortOrder,
-    /// Receiver for async directory scan results (GVFS paths scan in background)
-    pending_scan: Option<Receiver<Vec<FileTreeNode>>>,
+    /// Receiver for asynchronous root-directory scan results.
+    pending_scan: Option<Receiver<ExplorerScanResult>>,
 }
 
 impl FileExplorer {
@@ -333,20 +551,16 @@ impl FileExplorer {
             if entry_path.is_dir() {
                 // Show all directories - let users expand what they want
                 // (Avoids O(n×m) scanning during initial directory scan)
-                let display_name = truncate_display_name(&name, 22);
                 nodes.push(FileTreeNode::Directory {
                     path: entry_path,
                     name,
-                    display_name,
                     modified,
                     children: None, // Lazy - not loaded yet
                 });
             } else if Self::is_markdown_file(&entry_path) {
-                let display_name = truncate_display_name(&name, 25);
                 nodes.push(FileTreeNode::File {
                     path: entry_path,
                     name,
-                    display_name,
                     modified,
                 });
             }
@@ -401,8 +615,7 @@ impl FileExplorer {
             .unwrap_or(false)
     }
 
-    /// Set root directory and rescan (shallow).
-    /// For GVFS paths, scan runs in a background thread to avoid blocking the UI.
+    /// Set root directory and start a shallow background scan.
     fn set_root(&mut self, path: PathBuf) {
         // Convert empty path to current directory
         let path = if path.as_os_str().is_empty() {
@@ -411,61 +624,130 @@ impl FileExplorer {
             path
         };
         self.root = Some(path.clone());
-        if is_gvfs_path(&path) {
-            // Scan in background thread — tree populates when ready
-            let sort_order = self.sort_order;
-            let (tx, rx) = mpsc::channel();
-            std::thread::Builder::new()
-                .name("gvfs-scan".into())
-                .spawn(move || {
-                    let tree = Self::scan_directory_shallow(&path, sort_order);
-                    let _ = tx.send(tree);
-                })
-                .expect("failed to spawn GVFS scan thread");
-            self.pending_scan = Some(rx);
-        } else {
+        if !self.start_root_scan(path.clone(), "explorer-scan") {
             self.tree = Self::scan_directory_shallow(&path, self.sort_order);
+            Self::restore_expanded_children(&mut self.tree, &self.expanded_dirs, self.sort_order);
+        }
+    }
+
+    fn start_root_scan(&mut self, path: PathBuf, thread_name: &str) -> bool {
+        let sort_order = self.sort_order;
+        let expanded_dirs = self.expanded_dirs.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name(thread_name.to_owned())
+            .spawn(move || {
+                let mut tree = Self::scan_directory_shallow(&path, sort_order);
+                Self::restore_expanded_children(&mut tree, &expanded_dirs, sort_order);
+                let _ = tx.send(ExplorerScanResult {
+                    root: path,
+                    sort_order,
+                    tree,
+                });
+            });
+        if spawned.is_ok() {
+            self.pending_scan = Some(rx);
+            true
+        } else {
+            false
         }
     }
 
     /// Check if a background scan completed and apply results
     fn poll_pending_scan(&mut self) -> bool {
-        if let Some(rx) = &self.pending_scan {
-            if let Ok(tree) = rx.try_recv() {
-                self.tree = tree;
+        let received = self.pending_scan.as_ref().map(Receiver::try_recv);
+        let mut result = match received {
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) | None => return false,
+            Some(Err(TryRecvError::Disconnected)) => {
                 self.pending_scan = None;
-                return true;
+                return false;
             }
+        };
+        self.pending_scan = None;
+        if self.root.as_deref() != Some(result.root.as_path()) {
+            return false;
         }
-        false
+        if result.sort_order != self.sort_order {
+            Self::resort_tree_recursive(&mut result.tree, self.sort_order);
+        }
+        // Expansion can change while the worker is running. Reuse its snapshot
+        // and load any directories expanded after it started.
+        Self::restore_expanded_children(&mut result.tree, &self.expanded_dirs, self.sort_order);
+        self.tree = result.tree;
+        true
     }
 
-    /// Refresh the file tree (clears loaded state, rescans shallowly).
-    /// For GVFS paths, runs in background to avoid blocking the UI thread.
+    /// Refresh the file tree in the background.
     fn refresh(&mut self) {
         if let Some(root) = &self.root.clone() {
-            if is_gvfs_path(root) {
-                // Re-scan in background
-                let sort_order = self.sort_order;
-                let root = root.clone();
-                let (tx, rx) = mpsc::channel();
-                std::thread::Builder::new()
-                    .name("gvfs-refresh".into())
-                    .spawn(move || {
-                        let tree = Self::scan_directory_shallow(&root, sort_order);
-                        let _ = tx.send(tree);
-                    })
-                    .expect("failed to spawn GVFS refresh thread");
-                self.pending_scan = Some(rx);
+            if self.start_root_scan(root.clone(), "explorer-refresh") {
                 return;
             }
             self.tree = Self::scan_directory_shallow(root, self.sort_order);
-            // Re-load children for currently expanded directories
-            let expanded: Vec<PathBuf> = self.expanded_dirs.iter().cloned().collect();
-            for dir_path in expanded {
-                self.load_children(&dir_path);
+            Self::restore_expanded_children(&mut self.tree, &self.expanded_dirs, self.sort_order);
+        }
+    }
+
+    fn restore_expanded_children(
+        tree: &mut [FileTreeNode],
+        expanded_dirs: &HashSet<PathBuf>,
+        sort_order: SortOrder,
+    ) {
+        // Parents must be loaded before their expanded descendants can be
+        // found in the lazy tree.
+        let mut expanded: Vec<&PathBuf> = expanded_dirs.iter().collect();
+        expanded.sort_by_key(|path| path.components().count());
+        for path in expanded {
+            Self::load_children_in_tree(tree, path, sort_order);
+        }
+    }
+
+    /// Rescan only one changed directory while preserving the rest of the tree.
+    fn refresh_directory(&mut self, directory: &Path) {
+        let Some(root) = self.root.as_ref() else {
+            return;
+        };
+        if directory == root {
+            self.tree = Self::scan_directory_shallow(&root.clone(), self.sort_order);
+        } else {
+            let mut replacement = Some(Self::scan_directory_shallow(
+                &directory.to_path_buf(),
+                self.sort_order,
+            ));
+            if !Self::replace_directory_children(&mut self.tree, directory, &mut replacement) {
+                return;
             }
         }
+
+        // Restore expanded descendants from shallowest to deepest so their
+        // parents exist before lazy children are loaded.
+        let mut expanded: Vec<PathBuf> = self.expanded_dirs.iter().cloned().collect();
+        expanded.sort_by_key(|path| path.components().count());
+        for path in expanded {
+            self.load_children(&path);
+        }
+    }
+
+    fn replace_directory_children(
+        nodes: &mut [FileTreeNode],
+        directory: &Path,
+        replacement: &mut Option<Vec<FileTreeNode>>,
+    ) -> bool {
+        for node in nodes {
+            if let FileTreeNode::Directory { path, children, .. } = node {
+                if path == directory {
+                    *children = replacement.take();
+                    return true;
+                }
+                if let Some(children) = children {
+                    if Self::replace_directory_children(children, directory, replacement) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Load children for a specific directory (lazy loading)
@@ -664,10 +946,10 @@ impl Tab {
             .unwrap_or_else(|| "file://".to_string())
     }
 
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf) -> io::Result<Self> {
         // Canonicalize path for consistent comparison with watcher events
         let path = path.canonicalize().unwrap_or(path);
-        let content = fs::read_to_string(&path).unwrap_or_default();
+        let content = String::from_utf8_lossy(&fs::read(&path)?).into_owned();
         let parsed = parse_headers(&content);
         let local_links = parse_local_links(&content, &path);
         let content_lines = content.lines().count();
@@ -678,7 +960,7 @@ impl Tab {
             cache.add_link_hook(link);
         }
 
-        Self {
+        Ok(Self {
             id: egui::Id::new(&path),
             path,
             content,
@@ -699,7 +981,7 @@ impl Tab {
             history_forward: Vec::new(),
             search_matches: Vec::new(),
             content_version: 1,
-        }
+        })
     }
 
     fn title(&self) -> String {
@@ -709,32 +991,10 @@ impl Tab {
             .unwrap_or_else(|| "Unknown".to_string())
     }
 
-    fn reload(&mut self) {
-        if !self.path.exists() {
-            return;
-        }
-
-        if let Ok(bytes) = fs::read(&self.path) {
-            let content = String::from_utf8_lossy(&bytes);
-            self.content_lines = content.lines().count();
-            self.content = content.into_owned();
-            self.cache = CommonMarkCache::default();
-            self.content_version = self.content_version.wrapping_add(1);
-            self.base_uri = Self::compute_base_uri(&self.path);
-
-            let parsed = parse_headers(&self.content);
-            self.document_title = parsed.document_title;
-            self.outline_headers = parsed.outline_headers;
-            self.collapsed_headers.clear();
-
-            self.local_links = parse_local_links(&self.content, &self.path);
-            for link in &self.local_links {
-                self.cache.add_link_hook(link);
-            }
-
-            // Stale byte ranges; caller rebuilds if search bar is open
-            self.search_matches.clear();
-        }
+    fn reload(&mut self) -> io::Result<()> {
+        let content = String::from_utf8_lossy(&fs::read(&self.path)?).into_owned();
+        self.apply_loaded_content(self.path.clone(), content, false);
+        Ok(())
     }
 
     /// Rebuild `search_matches` for `query`. Empty query clears matches.
@@ -742,67 +1002,81 @@ impl Tab {
         self.search_matches = find_matches(&self.content, query);
     }
 
-    fn load_file(&mut self, path: &PathBuf) {
-        if !path.exists() {
-            return;
-        }
-
-        if let Ok(bytes) = fs::read(path) {
-            let content = String::from_utf8_lossy(&bytes);
-            self.content_lines = content.lines().count();
-            self.content = content.into_owned();
-            self.path = path.clone();
-            self.id = egui::Id::new(path);
-            self.cache = CommonMarkCache::default();
-            self.content_version = self.content_version.wrapping_add(1);
-            self.scroll_offset = 0.0;
-            self.pending_scroll_offset = None;
-            self.base_uri = Self::compute_base_uri(&self.path);
-
-            let parsed = parse_headers(&self.content);
-            self.document_title = parsed.document_title;
-            self.outline_headers = parsed.outline_headers;
-            self.collapsed_headers.clear();
-
-            self.local_links = parse_local_links(&self.content, &self.path);
-            for link in &self.local_links {
-                self.cache.add_link_hook(link);
-            }
-
-            // Stale byte ranges; caller rebuilds if search bar is open
-            self.search_matches.clear();
-        }
+    fn load_file(&mut self, path: &Path) -> io::Result<()> {
+        let content = String::from_utf8_lossy(&fs::read(path)?).into_owned();
+        self.apply_loaded_content(path.to_path_buf(), content, true);
+        Ok(())
     }
 
-    fn navigate_to_link(&mut self, link: &str) {
+    fn apply_loaded_content(&mut self, path: PathBuf, content: String, reset_scroll: bool) {
+        self.content_lines = content.lines().count();
+        self.content = content;
+        self.path = path;
+        self.id = egui::Id::new(&self.path);
+        self.cache = CommonMarkCache::default();
+        self.content_version = self.content_version.wrapping_add(1);
+        if reset_scroll {
+            self.scroll_offset = 0.0;
+            self.pending_scroll_offset = None;
+        }
+        self.base_uri = Self::compute_base_uri(&self.path);
+
+        let parsed = parse_headers(&self.content);
+        self.document_title = parsed.document_title;
+        self.outline_headers = parsed.outline_headers;
+        self.collapsed_headers.clear();
+
+        self.local_links = parse_local_links(&self.content, &self.path);
+        for link in &self.local_links {
+            self.cache.add_link_hook(link);
+        }
+
+        // Stale byte ranges; caller rebuilds if search bar is open.
+        self.search_matches.clear();
+    }
+
+    fn navigate_to_link(&mut self, link: &str) -> io::Result<bool> {
         if link.starts_with('#') {
-            return;
+            return Ok(false);
         }
 
         let Some(current_dir) = self.path.parent() else {
-            return;
+            return Ok(false);
         };
 
-        let Some(target_path) = resolve_local_link_path(link, current_dir) else {
-            return;
+        let path_part = link.split('#').next().unwrap_or(link);
+        let target_path = current_dir.join(path_part);
+
+        let target_path = match target_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return Ok(false),
         };
 
-        self.navigate_to_path(&target_path);
+        if target_path == self.path || !target_path.is_file() {
+            return Ok(false);
+        }
+        let previous_path = self.path.clone();
+        self.load_file(&target_path)?;
+        self.history_back.push(previous_path);
+        self.history_forward.clear();
+        Ok(true)
     }
 
     /// Replace this tab's document and record a browser-like history entry.
-    fn navigate_to_path(&mut self, target_path: &Path) -> bool {
+    /// Returns whether navigation happened; failures leave history untouched.
+    fn navigate_to_path(&mut self, target_path: &Path) -> io::Result<bool> {
         let Ok(target_path) = target_path.canonicalize() else {
-            return false;
+            return Ok(false);
         };
         if target_path == self.path || !target_path.is_file() {
-            return false;
+            return Ok(false);
         }
 
-        self.history_back.push(self.path.clone());
+        let previous_path = self.path.clone();
+        self.load_file(&target_path)?;
+        self.history_back.push(previous_path);
         self.history_forward.clear();
-        self.load_file(&target_path);
-        true
+        Ok(true)
     }
 
     fn check_link_hooks(&self) -> Option<String> {
@@ -822,18 +1096,26 @@ impl Tab {
         !self.history_forward.is_empty()
     }
 
-    fn navigate_back(&mut self) {
-        if let Some(prev_path) = self.history_back.pop() {
-            self.history_forward.push(self.path.clone());
-            self.load_file(&prev_path);
-        }
+    fn navigate_back(&mut self) -> io::Result<bool> {
+        let Some(prev_path) = self.history_back.last().cloned() else {
+            return Ok(false);
+        };
+        let current_path = self.path.clone();
+        self.load_file(&prev_path)?;
+        self.history_back.pop();
+        self.history_forward.push(current_path);
+        Ok(true)
     }
 
-    fn navigate_forward(&mut self) {
-        if let Some(next_path) = self.history_forward.pop() {
-            self.history_back.push(self.path.clone());
-            self.load_file(&next_path);
-        }
+    fn navigate_forward(&mut self) -> io::Result<bool> {
+        let Some(next_path) = self.history_forward.last().cloned() else {
+            return Ok(false);
+        };
+        let current_path = self.path.clone();
+        self.load_file(&next_path)?;
+        self.history_forward.pop();
+        self.history_back.push(current_path);
+        Ok(true)
     }
 
     fn resolve_link(&self, link: &str) -> Option<PathBuf> {
@@ -1003,40 +1285,74 @@ fn truncate_display_name(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Parse markdown headers from content, skipping code blocks.
+/// Parse headings with the same CommonMark rules used by the renderer.
 fn parse_headers(content: &str) -> ParsedHeaders {
-    let re = &*HEADER_RE;
-    let mut all_headers: Vec<Header> = Vec::new();
-    let mut in_code_block = false;
+    use pulldown_cmark::{Event, HeadingLevel, Tag, TagEnd};
 
-    for (line_number, line) in content.lines().enumerate() {
-        if line.trim_start().starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
+    fn level_number(level: HeadingLevel) -> u8 {
+        match level {
+            HeadingLevel::H1 => 1,
+            HeadingLevel::H2 => 2,
+            HeadingLevel::H3 => 3,
+            HeadingLevel::H4 => 4,
+            HeadingLevel::H5 => 5,
+            HeadingLevel::H6 => 6,
         }
+    }
 
-        if in_code_block {
-            continue;
-        }
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(content.match_indices('\n').map(|(offset, _)| offset + 1))
+        .collect();
+    let mut all_headers = Vec::new();
+    let mut current: Option<(u8, usize, usize, String)> = None;
 
-        if let Some(caps) = re.captures(line) {
-            let title = caps[2].trim().to_string();
-            let normalized_title = title.to_lowercase();
-            let display_title = truncate_display_name(&title, 35);
-            // Count prior headers with the same normalized title so each
-            // duplicate gets a distinct composite cache key.
-            let nth_with_same_text = all_headers
-                .iter()
-                .filter(|h| h.normalized_title == normalized_title)
-                .count();
-            all_headers.push(Header {
-                level: caps[1].len() as u8,
-                title,
-                display_title,
-                normalized_title,
-                nth_with_same_text,
-                line_number,
-            });
+    for (event, range) in
+        pulldown_cmark::Parser::new_ext(content, pulldown_cmark::Options::all()).into_offset_iter()
+    {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                let line_number = line_starts
+                    .partition_point(|line_start| *line_start <= range.start)
+                    .saturating_sub(1);
+                current = Some((level_number(level), range.start, line_number, String::new()));
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, source_start, line_number, title)) = current.take() {
+                    let title = title.trim().to_owned();
+                    if !title.is_empty() {
+                        all_headers.push(Header {
+                            level,
+                            display_title: truncate_display_name(&title, 35),
+                            title,
+                            source_start,
+                            line_number,
+                        });
+                    }
+                }
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push_str(&text);
+                }
+            }
+            Event::InlineMath(text) | Event::DisplayMath(text) => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push_str(&text);
+                }
+            }
+            Event::FootnoteReference(label) => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push('[');
+                    title.push_str(&label);
+                    title.push(']');
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, _, _, title)) = current.as_mut() {
+                    title.push(' ');
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1462,6 +1778,8 @@ struct MarkdownApp {
     // File explorer state
     file_explorer: FileExplorer,
     show_explorer: bool,
+    explorer_width: f32,
+    outline_width: f32,
     // Flash effect for updated files (path -> start time)
     flashing_paths: HashMap<PathBuf, Instant>,
     // True if running on virtual display (e.g., Xvfb :99) - limits frame rate
@@ -1527,7 +1845,7 @@ impl MarkdownApp {
             style.scroll_animation.points_per_second = 1500.0;
 
             // Reduce resize grab radius to prevent overlap with adjacent scrollbars
-            style.interaction.resize_grab_radius_side = 2.0;
+            style.interaction.resize_grab_radius_side = SIDEBAR_RESIZE_GRAB_RADIUS;
         });
 
         // Load persisted state
@@ -1543,17 +1861,33 @@ impl MarkdownApp {
         let show_outline = persisted.show_outline.unwrap_or(true);
         let full_width_content = persisted.full_width_content.unwrap_or(false);
         let show_explorer = persisted.show_explorer.unwrap_or(true);
+        let explorer_width =
+            restored_sidebar_width(persisted.explorer_width, EXPLORER_DEFAULT_WIDTH);
+        let outline_width = restored_sidebar_width(persisted.outline_width, OUTLINE_DEFAULT_WIDTH);
 
         // Determine initial tabs
+        let mut startup_error = None;
         let initial_tabs: Vec<Tab> = if let Some(ref path) = file {
             // CLI argument takes priority
-            vec![Tab::new(path.clone())]
+            match Tab::new(path.clone()) {
+                Ok(tab) => vec![tab],
+                Err(error) => {
+                    startup_error = Some(format!("Unable to open {}: {error}", path.display()));
+                    Vec::new()
+                }
+            }
         } else if let Some(paths) = persisted.open_tabs {
             // Restore previous session tabs
             paths
                 .into_iter()
                 .filter(|p| p.exists())
-                .map(Tab::new)
+                .filter_map(|path| match Tab::new(path.clone()) {
+                    Ok(tab) => Some(tab),
+                    Err(error) => {
+                        log::warn!("Unable to restore {}: {error}", path.display());
+                        None
+                    }
+                })
                 .collect()
         } else {
             // No file and no saved session → start empty (welcome page).
@@ -1618,7 +1952,7 @@ impl MarkdownApp {
             show_outline,
             full_width_content,
             watch_enabled: watch,
-            error_message: None,
+            error_message: startup_error,
             is_dragging: false,
             watcher: None,
             watcher_rx: None,
@@ -1628,6 +1962,8 @@ impl MarkdownApp {
             hovered_tab: None,
             file_explorer,
             show_explorer,
+            explorer_width,
+            outline_width,
             flashing_paths: HashMap::new(),
             is_virtual_display,
             egui_ctx: cc.egui_ctx.clone(),
@@ -1679,27 +2015,41 @@ impl MarkdownApp {
     }
 
     fn open_file_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Markdown", &["md", "markdown"])
-            .add_filter("Text", &["txt"])
-            .add_filter("All Files", &["*"])
-            .pick_file()
-        {
-            self.open_in_new_tab(path);
+        let initial_dir = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|tab| tab.path.parent())
+            .map(Path::to_path_buf)
+            .or_else(|| self.file_explorer.root.clone());
+
+        match pick_file(initial_dir.as_deref()) {
+            Ok(Some(path)) => self.open_in_new_tab(path),
+            Ok(None) => {}
+            Err(error) => {
+                log::error!("Unable to open file picker: {error}");
+                self.error_message = Some(format!("Unable to open file picker: {error}"));
+            }
         }
     }
 
     /// Open a native folder picker and point the file explorer at the chosen
     /// directory (issue #28). The chosen root is persisted via `save()`.
     fn open_folder_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            self.file_explorer.set_root(path);
-            // Make sure the explorer is visible so the result is seen.
-            self.show_explorer = true;
-            // Rebuild the watcher so the new root is watched recursively
-            // (`update_watched_paths` only reconciles tab paths, not the root).
-            if self.watch_enabled {
-                self.start_watching();
+        match pick_folder(self.file_explorer.root.as_deref()) {
+            Ok(Some(path)) => {
+                self.file_explorer.set_root(path);
+                // Make sure the explorer is visible so the result is seen.
+                self.show_explorer = true;
+                // Rebuild the watcher so the new root is watched recursively
+                // (`update_watched_paths` only reconciles tab paths, not the root).
+                if self.watch_enabled {
+                    self.start_watching();
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log::error!("Unable to open folder picker: {error}");
+                self.error_message = Some(format!("Unable to open folder picker: {error}"));
             }
         }
     }
@@ -1707,7 +2057,6 @@ impl MarkdownApp {
     fn open_in_new_tab(&mut self, path: PathBuf) {
         // Canonicalize for consistent comparison with existing tabs
         let path = path.canonicalize().unwrap_or(path);
-        self.record_recent(&path);
         // Check if already open
         if let Some(idx) = self.tabs.iter().position(|t| t.path == path) {
             self.active_tab = idx;
@@ -1716,7 +2065,14 @@ impl MarkdownApp {
         }
 
         // Add new tab
-        let tab = Tab::new(path);
+        let tab = match Tab::new(path.clone()) {
+            Ok(tab) => tab,
+            Err(error) => {
+                self.error_message = Some(format!("Unable to open {}: {error}", path.display()));
+                return;
+            }
+        };
+        self.record_recent(&path);
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         self.title_dirty = true;
@@ -1737,7 +2093,7 @@ impl MarkdownApp {
         let changed = self
             .tabs
             .get_mut(self.active_tab)
-            .is_some_and(|tab| tab.navigate_to_path(path));
+            .is_some_and(|tab| tab.navigate_to_path(path).unwrap_or(false));
         if !changed {
             return;
         }
@@ -1752,26 +2108,15 @@ impl MarkdownApp {
     }
 
     fn navigate_active_history(&mut self, go_back: bool) {
-        let previous_path = self.tabs.get(self.active_tab).map(|tab| tab.path.clone());
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        let result = self.tabs.get_mut(self.active_tab).map(|tab| {
             if go_back {
-                tab.navigate_back();
+                tab.navigate_back()
             } else {
-                tab.navigate_forward();
+                tab.navigate_forward()
             }
-        }
-        let current_path = self.tabs.get(self.active_tab).map(|tab| tab.path.clone());
-        if current_path == previous_path {
-            return;
-        }
-
-        if let Some(path) = current_path {
-            self.record_recent(&path);
-        }
-        self.title_dirty = true;
-        self.refresh_open_tab_paths();
-        if self.watch_enabled {
-            self.update_watched_paths();
+        });
+        if let Some(Err(error)) = result {
+            self.error_message = Some(format!("Unable to navigate history: {error}"));
         }
     }
 
@@ -1850,7 +2195,14 @@ impl MarkdownApp {
         }
     }
 
+    /// Start watching because of a user action or configuration change.
     fn start_watching(&mut self) {
+        self.watcher_retry_count = 0;
+        self.start_watching_attempt();
+    }
+
+    /// Construct watchers without resetting the recovery-attempt counter.
+    fn start_watching_attempt(&mut self) {
         self.stop_watching();
 
         let tab_paths = self.get_open_tab_paths();
@@ -1985,20 +2337,24 @@ impl MarkdownApp {
             // Bridge thread: forward events and wake egui on demand
             let (bridge_tx, bridge_rx) = mpsc::channel();
             let ctx = self.egui_ctx.clone();
-            std::thread::Builder::new()
+            let bridge = std::thread::Builder::new()
                 .name("watcher-bridge".into())
                 .spawn(move || {
                     while let Ok(event) = debouncer_rx.recv() {
                         let _ = bridge_tx.send(event);
                         ctx.request_repaint();
                     }
-                })
-                .expect("failed to spawn watcher bridge thread");
+                });
+
+            if let Err(error) = bridge {
+                log::error!("Failed to spawn watcher bridge thread: {error}");
+                self.error_message = Some(format!("Failed to start file watcher bridge: {error}"));
+                return;
+            }
 
             self.watcher = Some(fw);
             self.watcher_rx = Some(bridge_rx);
             self.watch_enabled = true;
-            self.watcher_retry_count = 0;
         } else {
             log::error!("Failed to create any file watcher");
             self.error_message = Some("Failed to create file watcher".to_string());
@@ -2109,15 +2465,18 @@ impl MarkdownApp {
             // Attempt recovery if watching is enabled and there's something to watch
             // Check actual tabs and explorer root, not watched_paths (which may be empty after failure)
             let has_watchable = !self.tabs.is_empty() || self.file_explorer.root.is_some();
-            if self.watch_enabled && has_watchable && self.watcher_retry_count < MAX_WATCHER_RETRIES
-            {
-                log::info!(
-                    "Attempting to recover file watcher (attempt {})",
-                    self.watcher_retry_count + 1
-                );
-                self.watcher_retry_count += 1;
-                self.start_watching();
-                self.egui_ctx.request_repaint_after(Duration::from_secs(2));
+            if self.watch_enabled && has_watchable {
+                if let Some(attempt) = next_watcher_retry(self.watcher_retry_count) {
+                    self.watcher_retry_count = attempt;
+                    log::info!("Attempting to recover file watcher (attempt {attempt})");
+                    self.start_watching_attempt();
+                    self.egui_ctx.request_repaint_after(Duration::from_secs(2));
+                } else {
+                    self.error_message = Some(format!(
+                        "File watcher failed after {MAX_WATCHER_RETRIES} retries"
+                    ));
+                    self.watch_enabled = false;
+                }
             }
             return Vec::new();
         };
@@ -2140,13 +2499,10 @@ impl MarkdownApp {
                     self.watcher = None;
                     self.watcher_rx = None;
 
-                    if self.watcher_retry_count < MAX_WATCHER_RETRIES {
-                        self.watcher_retry_count += 1;
-                        log::info!(
-                            "Attempting watcher recovery (attempt {})",
-                            self.watcher_retry_count
-                        );
-                        self.start_watching();
+                    if let Some(attempt) = next_watcher_retry(self.watcher_retry_count) {
+                        self.watcher_retry_count = attempt;
+                        log::info!("Attempting watcher recovery (attempt {attempt})");
+                        self.start_watching_attempt();
                         self.egui_ctx.request_repaint_after(Duration::from_secs(2));
                     } else {
                         self.error_message = Some(format!(
@@ -2165,7 +2521,7 @@ impl MarkdownApp {
 
     fn reload_changed_tabs(&mut self, changed_paths: Vec<PathBuf>) {
         let now = Instant::now();
-        let mut refresh_tree = false;
+        let mut refresh_directories = HashSet::new();
         // If the active tab gets reloaded while the find bar is open, its
         // `search_matches` will be cleared by `Tab::reload`. Force a rebuild
         // on the next frame by invalidating the cache-validity shadow state.
@@ -2180,7 +2536,9 @@ impl MarkdownApp {
             if let Some(root) = &self.file_explorer.root {
                 // Check if the changed path is within the explorer root
                 if path.starts_with(root) {
-                    refresh_tree = true;
+                    if let Some(parent) = path.parent() {
+                        refresh_directories.insert(parent.to_path_buf());
+                    }
                 }
 
                 let mut current = path.parent();
@@ -2205,7 +2563,11 @@ impl MarkdownApp {
             for tab in &mut self.tabs {
                 if tab.path == path {
                     log::info!("Reloading tab: {:?}", path);
-                    tab.reload();
+                    if let Err(error) = tab.reload() {
+                        self.error_message =
+                            Some(format!("Unable to reload {}: {error}", path.display()));
+                        continue;
+                    }
                     if Some(&tab.path) == active_path.as_ref() {
                         active_was_reloaded = true;
                     }
@@ -2217,10 +2579,10 @@ impl MarkdownApp {
             }
         }
 
-        // Refresh the file explorer tree if any changes were within the explorer root
-        if refresh_tree {
-            log::info!("Refreshing file explorer tree");
-            self.file_explorer.refresh();
+        // Refresh only affected parents instead of rebuilding the entire tree.
+        for directory in refresh_directories {
+            log::debug!("Refreshing explorer directory: {:?}", directory);
+            self.file_explorer.refresh_directory(&directory);
         }
     }
 
@@ -2531,12 +2893,19 @@ impl MarkdownApp {
                 ui.add_space(4.0);
             }
 
-            // New tab button
-            let new_tab_btn = ui.button("+").on_hover_text("New Tab (Ctrl+T)");
+            // Opening a file is what creates a new tab; there is no empty-tab state.
+            let new_tab_btn = ui
+                .button("+")
+                .on_hover_text("Open File in New Tab... (Ctrl+T)");
 
-            // Collect new tab button widget data for MCP
+            // Collect the open-file action for MCP.
             #[cfg(feature = "mcp")]
-            widget_data.push(("New Tab".to_string(), "button", new_tab_btn.rect, None));
+            widget_data.push((
+                "Open File in New Tab".to_string(),
+                "button",
+                new_tab_btn.rect,
+                None,
+            ));
 
             if new_tab_btn.clicked() {
                 self.open_file_dialog();
@@ -2593,11 +2962,10 @@ impl MarkdownApp {
 
         let is_dragging = ctx.input(|i| i.pointer.any_down());
 
-        egui::SidePanel::right("outline")
+        let panel = egui::SidePanel::right("outline")
             .resizable(true)
-            .default_width(200.0)
-            .min_width(120.0)
-            .max_width(400.0)
+            .default_width(self.outline_width)
+            .width_range(SIDEBAR_MIN_WIDTH..=f32::INFINITY)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
                     left: 8,
@@ -2664,8 +3032,11 @@ impl MarkdownApp {
                 // rows from clipping into each other.
                 let row_height = ui.spacing().interact_size.y.max(20.0);
 
-                egui::ScrollArea::vertical()
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                    )
                     .id_salt("outline")
                     .show_rows(ui, row_height, visible_indices.len(), |ui, row_range| {
                         let mut toggle_index: Option<usize> = None;
@@ -2725,8 +3096,10 @@ impl MarkdownApp {
                                     }
                                 }
 
-                                // Header title (pre-computed truncation)
-                                let response = ui.selectable_label(false, &header.display_title);
+                                let response = ui.add(
+                                    egui::Button::selectable(false, &header.title)
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                );
 
                                 // Collect header for MCP
                                 #[cfg(feature = "mcp")]
@@ -2752,6 +3125,7 @@ impl MarkdownApp {
                         }
                     });
             });
+        self.outline_width = panel.response.rect.width();
 
         // Register all collected widgets with MCP bridge
         #[cfg(feature = "mcp")]
@@ -2763,11 +3137,9 @@ impl MarkdownApp {
         // Calculate scroll target if header was clicked
         if let Some(idx) = clicked_header_index {
             if let Some(header) = tab.outline_headers.get(idx) {
-                // Composite key disambiguates duplicate-titled headers (e.g. two
-                // `## Installation` sections). Each occurrence has its own
-                // `nth_with_same_text` index assigned at parse time, and the
-                // renderer records positions under the same composite scheme.
-                let key = header_position_key(&header.normalized_title, header.nth_with_same_text);
+                // The renderer records the same source-stable key, so formatting
+                // and duplicate display titles cannot redirect the click.
+                let key = header_position_key(header.source_start);
                 // Try to get actual rendered position from cache first.
                 // With virtualization, the cache may hold a stale value from a
                 // partial render — record the key for the post-render
@@ -2923,6 +3295,7 @@ impl MarkdownApp {
 
     fn render_tab_content(&mut self, ui: &mut egui::Ui, ctrl_held: bool) -> Option<PathBuf> {
         let mut open_in_new_tab: Option<PathBuf> = None;
+        let mut navigation_error = None;
 
         // Snapshot search state before taking a mutable borrow on the active tab
         let search_is_open = self.search.is_open;
@@ -2956,7 +3329,7 @@ impl MarkdownApp {
         egui::Frame::NONE
             .inner_margin(egui::Margin {
                 left: 8,
-                right: 3,
+                right: CONTENT_RIGHT_RESIZE_GUTTER,
                 ..Default::default()
             })
             .show(ui, |ui| {
@@ -3091,8 +3464,14 @@ impl MarkdownApp {
                 }
             } else {
                 // Navigate in current tab
-                tab.navigate_to_link(&clicked_link);
+                if let Err(error) = tab.navigate_to_link(&clicked_link) {
+                    navigation_error = Some(format!("Unable to open {clicked_link}: {error}"));
+                }
             }
+        }
+
+        if let Some(error) = navigation_error {
+            self.error_message = Some(error);
         }
 
         open_in_new_tab
@@ -3107,15 +3486,14 @@ impl MarkdownApp {
             return action;
         }
 
-        egui::SidePanel::left("file_explorer")
+        let panel = egui::SidePanel::left("file_explorer")
             .resizable(true)
-            .default_width(200.0)
-            .min_width(150.0)
-            .max_width(300.0)
+            .default_width(self.explorer_width)
+            .width_range(SIDEBAR_MIN_WIDTH..=f32::INFINITY)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style()).inner_margin(egui::Margin {
                     left: 8,
-                    right: 8,
+                    right: EXPLORER_RIGHT_RESIZE_GUTTER,
                     top: 8,
                     bottom: 8,
                 }),
@@ -3219,7 +3597,7 @@ impl MarkdownApp {
                 let open_paths = self.open_tab_paths.clone();
 
                 // File tree inside ScrollArea
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .id_salt("file_explorer")
                     .show(ui, |ui| {
@@ -3246,6 +3624,7 @@ impl MarkdownApp {
                     self.reconcile_explorer_watches();
                 }
             });
+        self.explorer_width = panel.response.rect.width();
 
         action
     }
@@ -3281,12 +3660,7 @@ impl MarkdownApp {
         let indent = depth * 16;
 
         match node {
-            FileTreeNode::File {
-                path,
-                name,
-                display_name,
-                ..
-            } => {
+            FileTreeNode::File { path, name, .. } => {
                 // Calculate flash intensity for this file
                 let flash_intensity = self.get_flash_intensity(path);
                 let dark_mode = self.dark_mode;
@@ -3301,12 +3675,15 @@ impl MarkdownApp {
                     // Highlight if file is open in a tab
                     let is_open = open_paths.contains(path);
                     let text = if is_open {
-                        egui::RichText::new(display_name.as_str()).strong()
+                        egui::RichText::new(name.as_str()).strong()
                     } else {
-                        egui::RichText::new(display_name.as_str())
+                        egui::RichText::new(name.as_str())
                     };
 
-                    let response = ui.selectable_label(is_open, text);
+                    let response = ui.add(
+                        egui::Button::selectable(is_open, text)
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
                     #[cfg(feature = "mcp")]
                     {
                         let state_value = if is_open { "open" } else { "" };
@@ -3318,10 +3695,6 @@ impl MarkdownApp {
                         );
                     }
 
-                    // Show full name on hover if truncated
-                    if display_name.len() != name.len() {
-                        response.clone().on_hover_text(name);
-                    }
                     if response.clicked() {
                         action.file_to_open = Some(path.clone());
                     }
@@ -3362,12 +3735,7 @@ impl MarkdownApp {
                     ui.ctx().debug_painter().rect_filled(rect, 4.0, flash_color);
                 }
             }
-            FileTreeNode::Directory {
-                path,
-                name,
-                display_name,
-                ..
-            } => {
+            FileTreeNode::Directory { path, name, .. } => {
                 // Calculate flash intensity for this directory
                 let flash_intensity = self.get_flash_intensity(path);
                 let dark_mode = self.dark_mode;
@@ -3399,7 +3767,8 @@ impl MarkdownApp {
                     ui.label(folder_icon);
 
                     let response = ui.add(
-                        egui::Label::new(display_name.as_str())
+                        egui::Label::new(name.as_str())
+                            .extend()
                             .selectable(false)
                             .sense(egui::Sense::click()),
                     );
@@ -3412,11 +3781,6 @@ impl MarkdownApp {
                             &response,
                             Some(state_value),
                         );
-                    }
-
-                    // Show full name on hover if truncated
-                    if display_name.len() != name.len() {
-                        response.clone().on_hover_text(name);
                     }
 
                     // Click directory name to toggle expansion
@@ -3737,6 +4101,8 @@ impl eframe::App for MarkdownApp {
             explorer_root: self.file_explorer.root.clone(),
             expanded_dirs: Some(self.file_explorer.expanded_dirs.iter().cloned().collect()),
             explorer_sort_order: Some(self.file_explorer.sort_order),
+            explorer_width: Some(self.explorer_width),
+            outline_width: Some(self.outline_width),
             recent_files: Some(self.recent_files.clone()),
         };
         eframe::set_value(storage, APP_KEY, &state);
@@ -3759,10 +4125,10 @@ impl eframe::App for MarkdownApp {
             self.reload_changed_tabs(changed_paths);
         }
 
-        // Poll for async GVFS directory scan completion
+        // Poll for asynchronous Explorer root scan completion.
         if self.file_explorer.pending_scan.is_some() {
             if self.file_explorer.poll_pending_scan() {
-                log::info!("GVFS directory scan completed");
+                log::info!("Explorer directory scan completed");
             }
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -3891,7 +4257,7 @@ impl eframe::App for MarkdownApp {
                 if i.modifiers.ctrl && i.key_pressed(egui::Key::W) {
                     close_tab = true;
                 }
-                // Ctrl+T: New tab (open file dialog)
+                // Ctrl+T: Open a file in a new tab
                 if i.modifiers.ctrl && i.key_pressed(egui::Key::T) {
                     new_tab = true;
                 }
@@ -4036,6 +4402,13 @@ impl eframe::App for MarkdownApp {
         if let Some(idx) = focus_tab {
             self.focus_tab(idx);
         }
+        if go_back {
+            self.navigate_active_history(true);
+        }
+        if go_forward {
+            self.navigate_active_history(false);
+        }
+
         // Search bar actions (Ctrl+F open, Enter/Shift+Enter cycle, Esc close)
         if open_search {
             self.search.is_open = true;
@@ -4090,7 +4463,7 @@ impl eframe::App for MarkdownApp {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui
-                        .add(egui::Button::new("New Tab...").shortcut_text("Ctrl+T"))
+                        .add(egui::Button::new("Open File in New Tab...").shortcut_text("Ctrl+T"))
                         .clicked()
                     {
                         self.open_file_dialog();
@@ -4164,9 +4537,7 @@ impl eframe::App for MarkdownApp {
                         .add_enabled(can_back, egui::Button::new("← Back").shortcut_text("Alt+←"))
                         .clicked()
                     {
-                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                            tab.navigate_back();
-                        }
+                        self.navigate_active_history(true);
                         ui.close();
                     }
 
@@ -4182,9 +4553,7 @@ impl eframe::App for MarkdownApp {
                         )
                         .clicked()
                     {
-                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                            tab.navigate_forward();
-                        }
+                        self.navigate_active_history(false);
                         ui.close();
                     }
                 });
@@ -4686,6 +5055,32 @@ mod tests {
         assert_eq!(content_default_width(true), None);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn portal_introspection_detects_file_chooser_interface() {
+        let output = br#"interface org.freedesktop.portal.FileChooser {"#;
+        assert!(portal_introspection_has_file_chooser(output));
+        assert!(!portal_introspection_has_file_chooser(
+            b"interface org.freedesktop.portal.OpenURI {"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_folder_picker_output_means_cancelled() {
+        assert_eq!(path_from_picker_output(Vec::new()), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn folder_picker_output_preserves_path_bytes() {
+        let bytes = b"/tmp/example folder".to_vec();
+        assert_eq!(
+            path_from_picker_output(bytes),
+            Some(PathBuf::from("/tmp/example folder"))
+        );
+    }
+
     #[test]
     fn find_matches_empty_query_returns_none() {
         assert_eq!(find_matches("hello world", ""), vec![]);
@@ -4833,20 +5228,60 @@ mod tests {
     }
 
     #[test]
-    fn shortcode_heading_parser_keeps_raw_identity_and_duplicate_index() {
-        let parsed = parse_headers("# Doc\n\n## Pin :pushpin:\n\n## Pin :pushpin:\n");
+    fn tab_history_changes_only_after_successful_loads() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-history-safety-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.md");
+        let second = root.join("second.md");
+        fs::write(&first, "# First").unwrap();
+        fs::write(&second, "# Second").unwrap();
+
+        let mut tab = Tab::new(first.clone()).unwrap();
+        assert!(tab.navigate_to_link("second.md").unwrap());
+        assert_eq!(tab.path, second.canonicalize().unwrap());
+        assert!(tab.can_go_back());
+
+        fs::remove_file(&first).unwrap();
+        assert!(tab.navigate_back().is_err());
+        assert_eq!(tab.path, second.canonicalize().unwrap());
+        assert!(tab.can_go_back());
+        assert!(!tab.can_go_forward());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_new_tab_returns_an_error() {
+        let missing = std::env::temp_dir().join(format!(
+            "md-viewer-missing-{}-{}.md",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        assert!(Tab::new(missing).is_err());
+    }
+
+    #[test]
+    fn heading_parser_keeps_raw_shortcode_and_source_identity() {
+        let markdown = "# Doc\n\n## Pin :pushpin:\n\n## Pin :pushpin:\n";
+        let parsed = parse_headers(markdown);
+
         assert_eq!(parsed.outline_headers.len(), 3);
         assert_eq!(parsed.outline_headers[1].title, "Pin :pushpin:");
-        assert_eq!(parsed.outline_headers[1].normalized_title, "pin :pushpin:");
-        assert_eq!(parsed.outline_headers[1].nth_with_same_text, 0);
-        assert_eq!(parsed.outline_headers[2].normalized_title, "pin :pushpin:");
-        assert_eq!(parsed.outline_headers[2].nth_with_same_text, 1);
         assert_eq!(
-            header_position_key(
-                &parsed.outline_headers[2].normalized_title,
-                parsed.outline_headers[2].nth_with_same_text,
-            ),
-            "pin :pushpin:#1"
+            parsed.outline_headers[1].source_start,
+            markdown.find("## Pin").unwrap()
+        );
+        assert_eq!(
+            parsed.outline_headers[2].source_start,
+            markdown.rfind("## Pin").unwrap()
+        );
+        assert_eq!(
+            header_position_key(parsed.outline_headers[1].source_start),
+            "heading-source:7"
         );
     }
 
@@ -4854,9 +5289,25 @@ mod tests {
     fn unknown_shortcode_heading_stays_raw() {
         let parsed = parse_headers("# Doc\n\n## Pin :not_a_gemoji:\n");
         assert_eq!(parsed.outline_headers[1].title, "Pin :not_a_gemoji:");
+    }
+
+    #[test]
+    fn heading_parser_uses_commonmark_for_formatting_links_and_setext() {
+        let markdown = concat!(
+            "# **Bold** and `code` [link](guide.md)\n\n",
+            "Setext title\n---\n\n",
+            "~~~markdown\n# Hidden heading\n~~~\n",
+        );
+        let parsed = parse_headers(markdown);
+
+        assert_eq!(parsed.outline_headers.len(), 2);
+        assert_eq!(parsed.outline_headers[0].title, "Bold and code link");
+        assert_eq!(parsed.outline_headers[0].level, 1);
+        assert_eq!(parsed.outline_headers[1].title, "Setext title");
+        assert_eq!(parsed.outline_headers[1].level, 2);
         assert_eq!(
-            parsed.outline_headers[1].normalized_title,
-            "pin :not_a_gemoji:"
+            parsed.outline_headers[1].source_start,
+            markdown.find("Setext").unwrap()
         );
     }
 
@@ -4991,17 +5442,17 @@ mod tests {
         fs::write(&first, "# First").unwrap();
         fs::write(&second, "# Second").unwrap();
 
-        let mut tab = Tab::new(first.canonicalize().unwrap());
-        assert!(tab.navigate_to_path(&second));
+        let mut tab = Tab::new(first.canonicalize().unwrap()).unwrap();
+        assert!(tab.navigate_to_path(&second).unwrap());
         assert_eq!(tab.path, second.canonicalize().unwrap());
         assert!(tab.can_go_back());
         assert!(!tab.can_go_forward());
 
-        tab.navigate_back();
+        tab.navigate_back().unwrap();
         assert_eq!(tab.path, first.canonicalize().unwrap());
         assert!(tab.can_go_forward());
 
-        tab.navigate_forward();
+        tab.navigate_forward().unwrap();
         assert_eq!(tab.path, second.canonicalize().unwrap());
         fs::remove_dir_all(root).unwrap();
     }
@@ -5048,5 +5499,126 @@ mod tests {
             keyboard_scroll_target(25.0, 500.0, 300.0, KeyboardScrollAction::LineDown),
             0.0
         );
+    }
+
+    #[test]
+    fn watcher_retry_sequence_stops_at_configured_limit() {
+        assert_eq!(next_watcher_retry(0), Some(1));
+        assert_eq!(next_watcher_retry(1), Some(2));
+        assert_eq!(next_watcher_retry(2), Some(3));
+        assert_eq!(next_watcher_retry(3), None);
+        assert_eq!(next_watcher_retry(u32::MAX), None);
+    }
+    #[test]
+    fn asynchronous_explorer_result_restores_expanded_children() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-explorer-refresh-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        let expanded = root.join("docs");
+        fs::create_dir_all(&expanded).unwrap();
+        fs::write(expanded.join("guide.md"), "# Guide").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(ExplorerScanResult {
+            root: root.clone(),
+            sort_order: SortOrder::NameAsc,
+            tree: FileExplorer::scan_directory_shallow(&root, SortOrder::NameAsc),
+        })
+        .unwrap();
+        let mut explorer = FileExplorer {
+            root: Some(root.clone()),
+            expanded_dirs: HashSet::from([expanded.clone()]),
+            pending_scan: Some(rx),
+            ..Default::default()
+        };
+
+        assert!(explorer.poll_pending_scan());
+        assert!(explorer
+            .get_children(&expanded)
+            .is_some_and(|children| children.iter().any(|node| node.name() == "guide.md")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_root_scan_runs_asynchronously_and_restores_expansion() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-local-explorer-scan-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        let expanded = root.join("docs");
+        fs::create_dir_all(&expanded).unwrap();
+        fs::write(expanded.join("guide.md"), "# Guide").unwrap();
+
+        let mut explorer = FileExplorer {
+            expanded_dirs: HashSet::from([expanded.clone()]),
+            ..Default::default()
+        };
+        explorer.set_root(root.clone());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while explorer.pending_scan.is_some() && Instant::now() < deadline {
+            explorer.poll_pending_scan();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(explorer.pending_scan.is_none());
+        assert!(explorer
+            .get_children(&expanded)
+            .is_some_and(|children| children.iter().any(|node| node.name() == "guide.md")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn targeted_explorer_refresh_preserves_unrelated_subtrees() {
+        let root = std::env::temp_dir().join(format!(
+            "md-viewer-targeted-refresh-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        let docs = root.join("docs");
+        let notes = root.join("notes");
+        fs::create_dir_all(&docs).unwrap();
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(docs.join("old.md"), "# Old").unwrap();
+        fs::write(notes.join("keep.md"), "# Keep").unwrap();
+
+        let mut explorer = FileExplorer::default();
+        explorer.set_root(root.clone());
+        // set_root scans asynchronously since #84: drain the pending scan
+        // before interacting with the tree.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while explorer.pending_scan.is_some() && Instant::now() < deadline {
+            explorer.poll_pending_scan();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        explorer.toggle_expanded(&docs);
+        explorer.toggle_expanded(&notes);
+        fs::write(docs.join("new.md"), "# New").unwrap();
+
+        explorer.refresh_directory(&docs);
+
+        assert!(explorer
+            .get_children(&docs)
+            .is_some_and(|children| children.iter().any(|node| node.name() == "new.md")));
+        assert!(explorer
+            .get_children(&notes)
+            .is_some_and(|children| children.iter().any(|node| node.name() == "keep.md")));
+        assert!(explorer.is_expanded(&docs));
+        assert!(explorer.is_expanded(&notes));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_sidebar_widths_are_sanitized() {
+        assert_eq!(restored_sidebar_width(Some(320.0), 200.0), 320.0);
+        assert_eq!(restored_sidebar_width(Some(20.0), 200.0), SIDEBAR_MIN_WIDTH);
+        assert_eq!(restored_sidebar_width(Some(f32::NAN), 200.0), 200.0);
+        assert_eq!(restored_sidebar_width(Some(f32::INFINITY), 200.0), 200.0);
+        assert_eq!(restored_sidebar_width(None, 200.0), 200.0);
     }
 }
