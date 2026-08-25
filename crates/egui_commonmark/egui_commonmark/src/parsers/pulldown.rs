@@ -476,12 +476,6 @@ fn compute_layout_signature(ui: &egui::Ui, options: &CommonMarkOptions) -> u64 {
     h.finish()
 }
 
-/// Threshold for content-height drift from the last bootstrap that triggers a
-/// re-bootstrap to refresh split_points. Larger than the known ~44px egui
-/// oscillation between show()/show_viewport() content-size reporting, but
-/// small enough to catch real image-load growth.
-const CONTENT_H_DRIFT_THRESHOLD: f32 = 1024.0;
-
 /// Whether a TagEnd marks a safe block-level boundary for viewport-skip.
 ///
 /// At a block end the renderer's transient inline state (heading rich-text
@@ -681,6 +675,7 @@ impl CommonMarkViewerInternal {
             ui.spacing_mut().item_spacing.x = 0.0;
             let height = ui.text_style_height(&TextStyle::Body);
             ui.set_row_height(height);
+            let content_origin_y = ui.next_widget_position().y;
 
             // Use cached events — clone the Vec reference data for iteration
             // (events are 'static so this is cheap pointer copies, not re-parsing)
@@ -737,15 +732,28 @@ impl CommonMarkViewerInternal {
                         let scroll_cache = scroll_cache(cache, &source_id);
                         let end_position = ui.next_widget_position();
 
+                        let split_index = index.saturating_add(1);
                         let split_point_exists = scroll_cache
                             .split_points
                             .iter()
-                            .any(|(i, _, _)| *i == index);
+                            .any(|(i, _, _)| *i == split_index);
 
                         if !split_point_exists {
-                            scroll_cache
-                                .split_points
-                                .push((index, start_position, end_position));
+                            let relative_start = egui::pos2(
+                                start_position.x,
+                                (start_position.y - content_origin_y).max(0.0),
+                            );
+                            let relative_end = egui::pos2(
+                                end_position.x,
+                                (end_position.y - content_origin_y).max(0.0),
+                            );
+                            // Resume after this complete block. Starting at
+                            // its End tag would omit the matching Start state.
+                            scroll_cache.split_points.push((
+                                split_index,
+                                relative_start,
+                                relative_end,
+                            ));
                         }
                     }
                 }
@@ -756,8 +764,9 @@ impl CommonMarkViewerInternal {
             }
 
             if let Some(source_id) = split_points_id {
+                let content_height = (ui.next_widget_position().y - content_origin_y).max(0.0);
                 scroll_cache(cache, &source_id).page_size =
-                    Some(ui.next_widget_position().to_vec2());
+                    Some(egui::vec2(max_width, content_height));
             }
         });
 
@@ -779,6 +788,7 @@ impl CommonMarkViewerInternal {
         let available_size = ui.available_size();
         let scroll_id = source_id.with("_scroll_area");
         let layout_sig = compute_layout_signature(ui, options);
+        let layout_revision = cache.layout_revision();
 
         // Ensure parsed events are cached on the ScrollableCache, keyed by a
         // content version. The caller can provide a monotonic version (bumped
@@ -787,11 +797,11 @@ impl CommonMarkViewerInternal {
         // The big win either way is avoiding pulldown_cmark::Parser::new_ext +
         // collect on every frame (~52 ms at 100k lines).
         let version = content_version.unwrap_or_else(|| Self::hash_content(text));
-        let mut content_changed = false;
+        let mut layout_invalidated = false;
         {
             let sc = scroll_cache(cache, &source_id);
             if sc.events.is_empty() || sc.content_version != version {
-                content_changed = true;
+                layout_invalidated = true;
                 // Must mirror `show()`'s `math_enabled` derivation
                 // (parsers/pulldown.rs in this file: `options.math_fn.is_some()
                 // || cfg!(feature = "math")`). The bootstrap branch below
@@ -820,10 +830,17 @@ impl CommonMarkViewerInternal {
             // Width/zoom/theme change: y-coordinates are invalid for the
             // new layout, even though parsed events are still good.
             if sc.layout_signature != layout_sig {
+                layout_invalidated = true;
                 sc.layout_signature = layout_sig;
                 sc.page_size = None;
                 sc.split_points.clear();
                 sc.available_size = available_size;
+            }
+            if sc.layout_revision != layout_revision {
+                layout_invalidated = true;
+                sc.layout_revision = layout_revision;
+                sc.page_size = None;
+                sc.split_points.clear();
             }
             // When the caller wants to jump to a specific scroll position
             // (outline click, search-jump), we must paint *every* event
@@ -835,44 +852,18 @@ impl CommonMarkViewerInternal {
             // full-paint frame (~100 ms at 100k lines) per jump, which is
             // acceptable for a one-off action.
             //
-            // Critically, we DO NOT clear split_points here even though
-            // `page_size = None` forces a bootstrap. Reason: split_points
-            // store screen-y coordinates which are only meaningful at the
-            // scroll position they were captured at. The original scroll=0
-            // bootstrap stored values where screen-y ≈ content-y + panel
-            // chrome (~44 px). Clearing here lets the forced bootstrap at
-            // non-zero scroll re-populate them with screen-y values that
-            // diverge from content-y by the scroll amount, breaking every
-            // subsequent skip-paint's partition_point / allocate_space math
-            // by hundreds of pixels (visible as outline-click landing at
-            // the wrong heading and blank space at viewport top after
-            // scrolling). The push-site dedup-by-event-index keeps the
-            // original (good) values intact even though bootstrap re-runs.
+            // Keep the already-valid split points: this bootstrap is needed
+            // to paint every event for the jump, not to recompute geometry.
+            // The push site deduplicates by event index, so the full render
+            // can still refresh page_size without rebuilding the split list.
             if pending_scroll_offset.is_some() {
                 sc.page_size = None;
-            }
-            // Content-height drift check: if the previous frame's content
-            // height has drifted from when split_points were captured by
-            // more than CONTENT_H_DRIFT_THRESHOLD, the y-positions are stale
-            // (typically because async image/font loading shifted the doc
-            // after the initial bootstrap). Invalidate to trigger ONE
-            // re-bootstrap with refreshed positions. Uses absolute-drift
-            // hysteresis instead of bucketing because egui's `show()` vs
-            // `show_viewport()` content_size.y reporting differs by ~44 px
-            // (panel chrome) for the same content — any bucket-boundary
-            // approach would oscillate; only |drift| > threshold breaks
-            // out of that cycle.
-            if sc.bootstrap_content_h > 0.0
-                && (sc.last_content_h - sc.bootstrap_content_h).abs() > CONTENT_H_DRIFT_THRESHOLD
-            {
-                sc.page_size = None;
-                sc.split_points.clear();
             }
         }
         // Header positions are content-keyed; new content means the cached
         // y values point at the wrong headings. Done outside the `sc` borrow
         // scope above so `cache` is reborrowable.
-        if content_changed {
+        if layout_invalidated {
             cache.clear_header_positions();
         }
 
@@ -890,163 +881,122 @@ impl CommonMarkViewerInternal {
             sa
         };
 
-        // FORCE BOOTSTRAP EVERY FRAME: disable viewport-virtualization until
-        // the skip-paint slicing bugs are fully resolved (see
-        // docs/devlog/030-skip-paint-investigation.md for the design plan).
-        // The slice path renders events without their preceding container
-        // context (Start tags before the slice are missing), producing
-        // layout differences vs bootstrap — visible as flicker, wrong
-        // spacing, and shifted indents during scroll. Bootstrap renders
-        // the full document each frame; measured on T470 (i5-7200U, 2c):
-        // 1.2 ms / 348 events, 5.7 ms / 2514 events, 39 ms / 20k events,
-        // 229 ms / 100k events. Acceptable up to ~10k events; degraded
-        // above. The skip-paint code below is kept as `unreachable!`
-        // so future restoration can drop the early return.
-        {
+        // Bootstrap once after content/layout invalidation. It records safe
+        // top-level block boundaries and content-relative positions. Normal
+        // frames then paint only the viewport slice between clean boundaries.
+        if scroll_cache(cache, &source_id).page_size.is_none() {
             let out = make_scroll_area().show(ui, |ui| {
                 cache.set_scroll_offset(pending_scroll_offset.unwrap_or(0.0));
                 self.show(ui, cache, options, text, Some(source_id));
             });
             let sc = scroll_cache(cache, &source_id);
+            if let Some(page_size) = &mut sc.page_size {
+                // The ScrollArea output is the canonical extent. Nested
+                // widgets such as tables may advance the inner cursor beyond
+                // the space actually allocated by their outer response.
+                page_size.y = out.content_size.y;
+            }
             sc.available_size = available_size;
-            sc.last_content_h = out.content_size.y;
-            sc.bootstrap_content_h = out.content_size.y;
             return out;
         }
-        // Kept for future restoration once skip-paint is bug-free.
-        #[allow(unreachable_code)]
         let page_size_opt = scroll_cache(cache, &source_id).page_size;
-        #[allow(unreachable_code)]
         let Some(page_size) = page_size_opt else {
             unreachable!()
         };
 
         let num_rows = scroll_cache(cache, &source_id).events.len();
 
-        let out = make_scroll_area()
-            .show_viewport(ui, |ui, viewport| {
-                ui.set_height(page_size.y);
-                // ui.cursor().top() inside show_viewport is viewport-relative;
-                // record_header_position and record_active_search_y_viewport
-                // add this offset to recover content-relative y.
-                cache.set_scroll_offset(viewport.min.y);
-                let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
+        let out = make_scroll_area().show_viewport(ui, |ui, viewport| {
+            ui.set_height(page_size.y);
+            // The cursor inside show_viewport is viewport-relative; adding
+            // this offset recovers content-relative heading/search positions.
+            cache.set_scroll_offset(viewport.min.y);
+            let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
+            let max_width = options.max_width(ui);
 
-                let max_width = options.max_width(ui);
-                ui.allocate_ui_with_layout(egui::vec2(max_width, 0.0), layout, |ui| {
+            let (first_event_index, first_end_y, last_end_y, events_range) = {
+                let scroll_cache = scroll_cache(cache, &source_id);
+
+                // Keep one complete block of safety margin on both sides of
+                // the viewport, and only resume after a complete block.
+                let above = scroll_cache
+                    .split_points
+                    .partition_point(|(_, _, end)| end.y < viewport.min.y);
+                let (first_event_index, _, first_end_position) = if above >= 2 {
+                    scroll_cache.split_points[above - 2]
+                } else {
+                    (0, Pos2::ZERO, Pos2::ZERO)
+                };
+
+                let below = scroll_cache
+                    .split_points
+                    .partition_point(|(_, start, _)| start.y <= viewport.max.y);
+                let last_split = scroll_cache.split_points.get(below + 1);
+                let last_event_index = last_split
+                    .map(|(index, _, _)| *index)
+                    .unwrap_or(num_rows);
+                let last_end_y = last_split
+                    .map(|(_, _, end)| end.y)
+                    .unwrap_or(page_size.y);
+
+                let range_end = last_event_index.min(scroll_cache.events.len());
+                let events_range = if first_event_index < range_end {
+                    scroll_cache.events[first_event_index..range_end].to_vec()
+                } else {
+                    Vec::new()
+                };
+
+                (
+                    first_event_index,
+                    first_end_position.y,
+                    last_end_y,
+                    events_range,
+                )
+            };
+
+            // Match egui's show_rows strategy: size the parent to the full
+            // document, then place only the visible slice in an absolute child.
+            let content_top = ui.max_rect().top();
+            let slice_top = content_top + first_end_y;
+            let slice_bottom = (content_top + last_end_y.min(page_size.y)).max(slice_top);
+            let slice_rect = egui::Rect::from_x_y_ranges(
+                ui.max_rect().left()..=ui.max_rect().left() + max_width,
+                slice_top..=slice_bottom,
+            );
+
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(slice_rect).layout(layout),
+                |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    let scroll_cache = scroll_cache(cache, &source_id);
+                    ui.set_row_height(ui.text_style_height(&TextStyle::Body));
 
-                    // split_points are populated in event order, which matches
-                    // top-to-bottom layout order, so y-coords are monotonic
-                    // non-decreasing. Binary-search instead of linear filter:
-                    // O(log N) vs the old O(N) at 15k+ split points (100k-line doc).
-
-                    // First waypoint: the second-to-last split point whose
-                    // end.y is still above the viewport. Picking "second-to-last"
-                    // gives us a safety frame above the viewport top to avoid
-                    // clipping inline-flow content that started just above.
-                    let above = scroll_cache
-                        .split_points
-                        .partition_point(|(_, _, end)| end.y < viewport.min.y);
-                    let (first_event_index, _, first_end_position) = if above >= 2 {
-                        scroll_cache.split_points[above - 2]
-                    } else {
-                        (0, Pos2::ZERO, Pos2::ZERO)
-                    };
-
-                    // Last waypoint: the second split point whose start.y is
-                    // strictly below the viewport bottom. Same safety idea on
-                    // the bottom edge.
-                    let below = scroll_cache
-                        .split_points
-                        .partition_point(|(_, start, _)| start.y <= viewport.max.y);
-                    let last_event_index = scroll_cache
-                        .split_points
-                        .get(below + 1)
-                        .map(|(index, _, _)| *index)
-                        .unwrap_or(num_rows);
-
-                    // Clone only the events we'll actually iterate this frame
-                    // — the visible viewport plus safety margins above/below.
-                    // The previous implementation cloned the full Vec (~1.5 ms
-                    // at 30k events on Recent-Changes.md), then `skip`ed all
-                    // but ~150 events. This trims the clone to the actual
-                    // range used, dropping per-frame allocation churn from
-                    // ~1.5 ms to ~10 µs on the same doc. The slice clone is
-                    // released before `process_event` mutably re-borrows the
-                    // cache for syntect/header state — NLL covers this.
-                    let range_end = last_event_index.min(scroll_cache.events.len());
-                    let events_range: Vec<(pulldown_cmark::Event<'static>, Range<usize>)> =
-                        if first_event_index < range_end {
-                            scroll_cache.events[first_event_index..range_end].to_vec()
-                        } else {
-                            Vec::new()
-                        };
-
-                    let last_sp_y_used = scroll_cache
-                        .split_points
-                        .get(below + 1)
-                        .map(|p| p.2.y)
-                        .unwrap_or(0.0);
-                    eprintln!(
-                        "[SKIP] vp=[{:.0},{:.0}] evt=[{},{}]/{} sp_y=[{:.0},{:.0}] a={} b={}",
-                        viewport.min.y, viewport.max.y,
-                        first_event_index, last_event_index, num_rows,
-                        first_end_position.y, last_sp_y_used,
-                        above, below
-                    );
-                    // Advance cursor VERTICALLY by first_end_position.y to
-                    // position events at the right viewport y. `to_vec2()`
-                    // would also pass first_end_position.x as allocation
-                    // width — that's the X-cursor where the previous block
-                    // ended (often a non-zero left margin or a list-indent
-                    // depth). In `left_to_right(BOTTOM).with_main_wrap`,
-                    // allocate_space consumes that as width-advance,
-                    // shifting subsequent events right and breaking
-                    // indentation of code blocks, tables, and text.
-                    ui.allocate_space(egui::vec2(0.0, first_end_position.y));
-
-                    // Re-attach original indices via map so peekable iteration
-                    // and downstream consumers still see the absolute event
-                    // index (used by `if i == 0 { ... }` below for the
-                    // bootstrap-newline gate).
                     let mut events = events_range
                         .into_iter()
                         .enumerate()
-                        .map(|(offset, ev)| (offset + first_event_index, ev))
+                        .map(|(offset, event)| (offset + first_event_index, event))
                         .peekable();
 
-                    while let Some((i, (e, src_span))) = events.next() {
+                    while let Some((index, (event, src_span))) = events.next() {
                         if events.peek().is_none() {
                             self.line.should_end_newline_forced = false;
                         }
-
-                        self.process_event(ui, &mut events, e, src_span, cache, options, max_width);
-
-                        if i == 0 {
+                        self.process_event(
+                            ui,
+                            &mut events,
+                            event,
+                            src_span,
+                            cache,
+                            options,
+                            max_width,
+                        );
+                        if index == 0 {
                             self.line.should_not_start_newline_forced = false;
                         }
                     }
-                });
-            });
-        // NOTE: deliberately NOT updating last_content_h from skip-paint's
-        // `out.content_size.y`. That value is unreliable: skip-paint does
-        // `set_height(page_size.y)` (min height) then `allocate_space(Vec2(0,
-        // first_end_position.y))` which can advance the cursor by tens of
-        // thousands of px when scrolled deep — content_size.y inflates to
-        // 2× the real document height. Feeding that into the drift check
-        // triggers an invalidation, re-bootstrap fires at the current
-        // (non-zero) scroll, split_points get repopulated with screen-y
-        // coords that are catastrophically off, the next skip-paint picks
-        // wrong events, content_h spikes the other way, drift fires again
-        // — death spiral. Empirically: 619 bootstraps in 30 s of scroll on
-        // T470, panel flickered blank with garbled styling. Restricting
-        // drift signal to bootstrap-only content_h prevents the false
-        // positive. Async-image-load growth is still caught — that fires
-        // during the SECOND bootstrap (which is allowed to happen for
-        // other reasons, e.g. font/scrollbar layout settling at startup),
-        // where the new content_h IS written to last_content_h.
+                },
+            );
+        });
+        // The absolutely positioned slice preserves the bootstrap content extent.
 
         // Scroll-overshoot clamp.
         let real_max_scroll = (page_size.y - out.inner_rect.height()).max(0.0);
@@ -2316,6 +2266,58 @@ mod tests {
             let cell = vec![(Event::InlineMath(r"\frac{a}{b}".into()), 0..11)];
 
             assert!(table_cell_height(&cell, line_height, &cache, ui) >= line_height * 2.0);
+        });
+    }
+
+    #[test]
+    fn scrollable_renderer_resumes_only_after_complete_blocks() {
+        egui::__run_test_ui(|ui| {
+            ui.set_width(600.0);
+            ui.set_height(300.0);
+            let markdown = concat!(
+                "# Heading\n\n",
+                "Paragraph before.\n\n",
+                "- outer\n  - nested\n  - nested two\n- second\n\n",
+                "> quoted\n> continuation\n\n",
+                "| a | b |\n|---|---|\n| one | two |\n\n",
+                "Final paragraph.\n",
+            );
+            let source_id = egui::Id::new("virtualization-regression");
+            let mut cache = CommonMarkCache::default();
+            let options = CommonMarkOptions::default();
+
+            CommonMarkViewerInternal::new().show_scrollable(
+                source_id,
+                ui,
+                &mut cache,
+                &options,
+                markdown,
+                Some(1),
+                None,
+                None,
+            );
+            let sc = scroll_cache(&mut cache, &source_id);
+            assert!(sc.page_size.is_some_and(|size| size.y > 0.0));
+            assert!(!sc.split_points.is_empty());
+            for (index, _, _) in &sc.split_points {
+                if let Some((event, _)) = sc.events.get(*index) {
+                    assert!(
+                        !matches!(event, Event::End(_)),
+                        "split resumed at an unmatched End event: {event:?}"
+                    );
+                }
+            }
+
+            CommonMarkViewerInternal::new().show_scrollable(
+                source_id,
+                ui,
+                &mut cache,
+                &options,
+                markdown,
+                Some(1),
+                None,
+                None,
+            );
         });
     }
 
