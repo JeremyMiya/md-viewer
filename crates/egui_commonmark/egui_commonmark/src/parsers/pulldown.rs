@@ -956,6 +956,17 @@ impl CommonMarkViewerInternal {
             let out = make_scroll_area().show(ui, |ui| {
                 cache.set_scroll_offset(pending_scroll_offset.unwrap_or(0.0));
                 self.show(ui, cache, options, text, Some(source_id));
+
+                // Leave a small scroll-safe area below the final rendered
+                // block. The last widget can visually extend a few pixels
+                // beyond the layout extent recorded by ScrollArea,
+                // particularly after wrapping/font/layout adjustments.
+                //
+                // Without this margin the maximum scroll offset can stop
+                // while the final line is still partially clipped.
+                let bottom_padding =
+                    ui.text_style_height(&TextStyle::Body) * 1.5;
+                ui.add_space(bottom_padding);
             });
             let sc = scroll_cache(cache, &source_id);
             if let Some(page_size) = &mut sc.page_size {
