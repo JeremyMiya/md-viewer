@@ -1145,7 +1145,7 @@ fn parse_local_links(content: &str, document_path: &Path) -> Vec<String> {
             }
             pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link { dest_url, .. }) => {
                 let destination = dest_url.as_ref();
-                if is_local_markdown_link(destination) || destination.starts_with('#') {
+                if is_local_file_link(destination) || destination.starts_with('#') {
                     links.insert(destination.to_owned());
                 }
             }
@@ -1218,6 +1218,24 @@ fn register_existing_markdown_path(
     }
 }
 
+/// Check whether a link destination is a local filesystem target.
+///
+/// Relative paths, absolute filesystem paths and file:// URIs are local.
+/// URI schemes such as http:, https:, mailto:, data:, etc. remain external.
+fn is_local_file_link(destination: &str) -> bool {
+    if destination.starts_with('#') {
+        return false;
+    }
+
+    if destination.starts_with("file://") {
+        return true;
+    }
+
+    // A successfully parsed absolute URI has an explicit scheme and should
+    // remain external. Relative filesystem paths do not parse as absolute URLs.
+    url::Url::parse(destination).is_err()
+}
+
 /// Check if a link destination points to a local markdown file
 fn is_local_markdown_link(destination: &str) -> bool {
     if destination.starts_with("http://")
@@ -1266,6 +1284,28 @@ fn resolve_local_link_path(destination: &str, document_dir: &Path) -> Option<Pat
     } else {
         document_dir.join(path)
     })
+}
+
+/// Open a local filesystem target with the desktop's default application.
+///
+/// Markdown documents are handled internally by md-viewer. This function is
+/// for other local targets such as HTML, PDF, DOCX, images, archives, folders,
+/// media files, etc.
+fn open_local_path(path: &Path) -> io::Result<()> {
+    let status = Command::new("xdg-open")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "xdg-open exited with status {status}"
+        )))
+    }
 }
 
 /// Parse headings with the same CommonMark rules used by the renderer.
@@ -3437,17 +3477,43 @@ impl MarkdownApp {
                 }
             });
 
-        // Check for clicked links
+        // Check for clicked local links.
+        //
+        // Markdown/text documents stay inside md-viewer. Other local
+        // filesystem targets are resolved relative to the current Markdown
+        // document and opened with the desktop's default application.
         if let Some(clicked_link) = tab.check_link_hooks() {
-            if ctrl_held {
-                // Open in new tab
-                if let Some(target_path) = tab.resolve_link(&clicked_link) {
-                    open_in_new_tab = Some(target_path);
+            if clicked_link.starts_with('#') {
+                // Anchor-only links are already intercepted so they do not
+                // accidentally escape to the external browser.
+            } else if is_local_markdown_link(&clicked_link) {
+                if ctrl_held {
+                    // Open Markdown in a new md-viewer tab.
+                    if let Some(target_path) = tab.resolve_link(&clicked_link) {
+                        open_in_new_tab = Some(target_path);
+                    }
+                } else {
+                    // Navigate Markdown in the current md-viewer tab.
+                    if let Err(error) = tab.navigate_to_link(&clicked_link) {
+                        navigation_error = Some(format!("Unable to open {clicked_link}: {error}"));
+                    }
                 }
             } else {
-                // Navigate in current tab
-                if let Err(error) = tab.navigate_to_link(&clicked_link) {
-                    navigation_error = Some(format!("Unable to open {clicked_link}: {error}"));
+                // Non-Markdown local file: resolve it relative to the current
+                // Markdown document, then delegate to the OS default app.
+                match tab.resolve_link(&clicked_link) {
+                    Some(target_path) => {
+                        if let Err(error) = open_local_path(&target_path) {
+                            navigation_error = Some(format!(
+                                "Unable to open local file {}: {error}",
+                                target_path.display()
+                            ));
+                        }
+                    }
+                    None => {
+                        navigation_error =
+                            Some(format!("Unable to resolve local file: {clicked_link}"));
+                    }
                 }
             }
         }
