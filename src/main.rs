@@ -1015,6 +1015,9 @@ impl Tab {
         if reset_scroll {
             self.scroll_offset = 0.0;
             self.pending_scroll_offset = None;
+            self.pending_header_click_key = None;
+            self.last_content_height = 0.0;
+            self.last_viewport_height = 0.0;
         }
         self.base_uri = Self::compute_base_uri(&self.path);
 
@@ -1032,30 +1035,98 @@ impl Tab {
         self.search_matches.clear();
     }
 
+    /// Scroll this tab to a Markdown heading addressed by a URL fragment.
+    ///
+    /// The renderer already records heading positions under source-stable
+    /// keys for Outline navigation. Reuse exactly that mechanism here rather
+    /// than maintaining a second set of scroll coordinates.
+    fn scroll_to_fragment(&mut self, fragment: &str) -> bool {
+        let Some((source_start, line_number)) = find_heading_fragment(&self.content, fragment)
+        else {
+            return false;
+        };
+
+        let key = header_position_key(source_start);
+
+        if let Some(y_pos) = self.cache.get_header_position(&key) {
+            // Layout is already known: jump directly.
+            self.pending_scroll_offset = Some((y_pos - 50.0).max(0.0));
+            self.pending_header_click_key = None;
+        } else {
+            // Force a full bootstrap paint. Once the renderer records the
+            // exact heading Y, render_tab_content's existing corrective path
+            // will snap to the precise location.
+            let estimated_y = if self.last_content_height > 0.0 && self.content_lines > 0 {
+                (line_number as f32 / self.content_lines as f32) * self.last_content_height
+            } else {
+                0.0
+            };
+
+            self.pending_scroll_offset = Some((estimated_y - 50.0).max(0.0));
+            self.pending_header_click_key = Some(key);
+        }
+
+        true
+    }
+
     fn navigate_to_link(&mut self, link: &str) -> io::Result<bool> {
-        if link.starts_with('#') {
-            return Ok(false);
+        let (path_part, fragment) = match link.split_once('#') {
+            Some((path, fragment)) => {
+                let fragment = (!fragment.is_empty()).then_some(fragment);
+                (path, fragment)
+            }
+            None => (link, None),
+        };
+
+        // Pure in-document fragment:
+        //
+        //     [Section](#section)
+        //
+        if path_part.is_empty() {
+            return Ok(fragment
+                .map(|fragment| self.scroll_to_fragment(fragment))
+                .unwrap_or(false));
         }
 
         let Some(current_dir) = self.path.parent() else {
             return Ok(false);
         };
 
-        let path_part = link.split('#').next().unwrap_or(link);
-        let target_path = current_dir.join(path_part);
+        let Some(target_path) = resolve_local_link_path(path_part, current_dir) else {
+            return Ok(false);
+        };
 
         let target_path = match target_path.canonicalize() {
-            Ok(p) => p,
+            Ok(path) => path,
             Err(_) => return Ok(false),
         };
 
-        if target_path == self.path || !target_path.is_file() {
+        if !target_path.is_file() {
             return Ok(false);
         }
+
+        // A path that resolves back to the current document may still contain
+        // a useful fragment.
+        if target_path == self.path {
+            return Ok(fragment
+                .map(|fragment| self.scroll_to_fragment(fragment))
+                .unwrap_or(false));
+        }
+
         let previous_path = self.path.clone();
+
         self.load_file(&target_path)?;
+
         self.history_back.push(previous_path);
         self.history_forward.clear();
+
+        // The newly loaded document has a fresh renderer cache. Scheduling the
+        // fragment here causes the first full paint to populate the heading
+        // position, followed by the existing precise corrective scroll.
+        if let Some(fragment) = fragment {
+            self.scroll_to_fragment(fragment);
+        }
+
         Ok(true)
     }
 
@@ -1306,6 +1377,74 @@ fn open_local_path(path: &Path) -> io::Result<()> {
             "xdg-open exited with status {status}"
         )))
     }
+}
+
+/// Generate a GitHub-style heading slug.
+///
+/// Examples:
+///   "1. 安装或更新 Ventoy" -> "1-安装或更新-ventoy"
+///   "Hello, World!"       -> "hello-world"
+///
+/// Unicode letters/numbers are preserved; whitespace becomes '-';
+/// punctuation other than '-' and '_' is removed.
+fn github_heading_slug_base(title: &str) -> String {
+    let mut slug = String::new();
+
+    for ch in title.to_lowercase().chars() {
+        if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+            slug.push(ch);
+        } else if ch.is_whitespace() {
+            slug.push('-');
+        }
+    }
+
+    slug
+}
+
+/// Find a heading addressed by a URL fragment.
+///
+/// Duplicate headings follow GitHub's numbering convention:
+///
+///   ## Test       -> #test
+///   ## Test       -> #test-1
+///   ## Test       -> #test-2
+///
+/// Returns `(source_start, line_number)`, which can be converted into the
+/// same renderer cache key used by the Outline sidebar.
+fn find_heading_fragment(content: &str, fragment: &str) -> Option<(usize, usize)> {
+    let raw_fragment = fragment.strip_prefix('#').unwrap_or(fragment);
+
+    let decoded = percent_encoding::percent_decode_str(raw_fragment)
+        .decode_utf8()
+        .ok()?;
+
+    let wanted = decoded.as_ref();
+    if wanted.is_empty() {
+        return None;
+    }
+
+    let parsed = parse_headers(content);
+    let mut seen: HashMap<String, usize> = HashMap::new();
+
+    for header in parsed.outline_headers {
+        let base = github_heading_slug_base(&header.title);
+
+        let count = seen.entry(base.clone()).or_insert(0);
+
+        let slug = if *count == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{}", *count)
+        };
+
+        *count += 1;
+
+        if slug == wanted {
+            return Some((header.source_start, header.line_number));
+        }
+    }
+
+    None
 }
 
 /// Parse headings with the same CommonMark rules used by the renderer.
@@ -3315,8 +3454,12 @@ impl MarkdownApp {
         }
     }
 
-    fn render_tab_content(&mut self, ui: &mut egui::Ui, ctrl_held: bool) -> Option<PathBuf> {
-        let mut open_in_new_tab: Option<PathBuf> = None;
+    fn render_tab_content(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctrl_held: bool,
+    ) -> Option<(PathBuf, Option<String>)> {
+        let mut open_in_new_tab: Option<(PathBuf, Option<String>)> = None;
         let mut navigation_error = None;
 
         // Snapshot search state before taking a mutable borrow on the active tab
@@ -3484,13 +3627,20 @@ impl MarkdownApp {
         // document and opened with the desktop's default application.
         if let Some(clicked_link) = tab.check_link_hooks() {
             if clicked_link.starts_with('#') {
-                // Anchor-only links are already intercepted so they do not
-                // accidentally escape to the external browser.
+                // In-document heading link.
+                if let Err(error) = tab.navigate_to_link(&clicked_link) {
+                    navigation_error = Some(format!("Unable to open {clicked_link}: {error}"));
+                }
             } else if is_local_markdown_link(&clicked_link) {
                 if ctrl_held {
                     // Open Markdown in a new md-viewer tab.
                     if let Some(target_path) = tab.resolve_link(&clicked_link) {
-                        open_in_new_tab = Some(target_path);
+                        let fragment = clicked_link
+                            .split_once('#')
+                            .map(|(_, fragment)| fragment.to_owned())
+                            .filter(|fragment| !fragment.is_empty());
+
+                        open_in_new_tab = Some((target_path, fragment));
                     }
                 } else {
                     // Navigate Markdown in the current md-viewer tab.
@@ -4873,7 +5023,7 @@ impl eframe::App for MarkdownApp {
         self.render_outline(ctx);
 
         // Main content area
-        let mut open_in_new_tab: Option<PathBuf> = None;
+        let mut open_in_new_tab: Option<(PathBuf, Option<String>)> = None;
         let path_before_render = self.tabs.get(self.active_tab).map(|tab| tab.path.clone());
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::ZERO))
@@ -4895,9 +5045,16 @@ impl eframe::App for MarkdownApp {
             }
         }
 
-        // Open link in new tab if requested
-        if let Some(path) = open_in_new_tab {
+        // Open link in new tab if requested. Preserve an optional heading
+        // fragment so Ctrl/Cmd+click behaves the same as a normal link click.
+        if let Some((path, fragment)) = open_in_new_tab {
             self.open_in_new_tab(path);
+
+            if let Some(fragment) = fragment {
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.scroll_to_fragment(&fragment);
+                }
+            }
         }
 
         // Check if a mermaid diagram was clicked → open lightbox
