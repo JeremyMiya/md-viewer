@@ -468,8 +468,6 @@ pub struct CommonMarkViewerInternal {
     current_heading_y: Option<f32>,
     current_heading_source_start: Option<usize>,
     current_heading_text: String,
-    /// Accumulate heading RichText fragments for single render at end
-    current_heading_rich_texts: Vec<egui::RichText>,
 }
 
 pub(crate) struct CheckboxClickEvent {
@@ -497,7 +495,6 @@ impl CommonMarkViewerInternal {
             current_heading_y: None,
             current_heading_source_start: None,
             current_heading_text: String::new(),
-            current_heading_rich_texts: Vec::new(),
         }
     }
 }
@@ -1652,8 +1649,13 @@ impl CommonMarkViewerInternal {
         } else if self.text_style.heading.is_some() {
             self.current_heading_text
                 .push_str(raw_heading_text.unwrap_or(&text));
-            // Accumulate RichText - will render all at once in end_tag(Heading)
-            self.current_heading_rich_texts.push(rich_text);
+
+            // Heading content is inline content. Render text immediately so
+            // images, links, emphasis, inline code, and text preserve their
+            // original CommonMark order. Delaying heading text until
+            // TagEnd::Heading caused immediately-rendered inline widgets such
+            // as images to be overwritten by text repainted from the left edge.
+            ui.label(rich_text);
         } else if self.is_table {
             ui.add(egui::Label::new(rich_text).wrap());
         } else {
@@ -1953,21 +1955,6 @@ impl CommonMarkViewerInternal {
                 paragraph_end_spacing(ui, &options.typography);
             }
             pulldown_cmark::TagEnd::Heading { .. } => {
-                // Render all accumulated heading fragments at once, positioned at left edge
-                if !self.current_heading_rich_texts.is_empty() {
-                    let available = ui.available_rect_before_wrap();
-                    let left_edge = ui.min_rect().left();
-                    let heading_rect = egui::Rect::from_min_size(
-                        egui::pos2(left_edge, available.top()),
-                        egui::vec2(available.width() + (available.left() - left_edge), available.height()),
-                    );
-                    let rich_texts = std::mem::take(&mut self.current_heading_rich_texts);
-                    ui.scope_builder(egui::UiBuilder::new().max_rect(heading_rect), |ui| {
-                        for rt in rich_texts {
-                            ui.label(rt);
-                        }
-                    });
-                }
                 // Record under a source-stable key shared with the Outline parser.
                 if let Some(y) = self.current_heading_y.take() {
                     if let Some(source_start) = self.current_heading_source_start.take() {
