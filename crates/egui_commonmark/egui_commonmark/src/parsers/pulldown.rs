@@ -7,7 +7,7 @@ use egui::{self, Id, Pos2, TextStyle, Ui};
 
 use crate::List;
 use egui_commonmark_backend_extended::elements::{
-    blockquote, footnote, footnote_start, heading_end_spacing, heading_start_spacing, newline,
+    blockquote, footnote, footnote_start, newline,
     paragraph_end_spacing, rule, soft_break, ImmutableCheckbox,
 };
 use egui_commonmark_backend_extended::misc::*;
@@ -1818,14 +1818,13 @@ impl CommonMarkViewerInternal {
                 self.line.try_insert_start(ui);
             }
             pulldown_cmark::Tag::Heading { level, .. } => {
-                // End current row to ensure heading starts at left edge
+                // Finish whatever inline row preceded the heading.
                 ui.end_row();
-                // Record position BEFORE spacing for scroll navigation
+
                 self.current_heading_y = Some(ui.cursor().top());
                 self.current_heading_source_start = Some(source_start);
                 self.current_heading_text.clear();
-                // Add extra spacing above headings if configured
-                heading_start_spacing(ui, &options.typography);
+
                 self.text_style.heading = Some(match level {
                     HeadingLevel::H1 => 0,
                     HeadingLevel::H2 => 1,
@@ -2001,8 +2000,6 @@ impl CommonMarkViewerInternal {
                 }
                 self.current_heading_source_start = None;
                 self.current_heading_text.clear();
-                // Add extra spacing below headings if configured
-                heading_end_spacing(ui, &options.typography);
                 self.line.try_insert_end(ui);
                 self.text_style.heading = None;
             }
