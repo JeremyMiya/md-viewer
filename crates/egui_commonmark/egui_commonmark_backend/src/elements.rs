@@ -110,21 +110,35 @@ fn marker_center(rect: egui::Rect, raw: f32) -> egui::Pos2 {
 }
 
 #[inline]
+#[inline]
 pub fn footnote_start(ui: &mut Ui, note: &str) -> egui::Response {
     let color = ui.visuals().hyperlink_color;
 
-    ui.add(
-        egui::Label::new(
-            RichText::new(format!("[{note}]"))
-                .small()
-                .raised()
-                .color(color)
-                .underline(),
+    let response = ui
+        .add(
+            egui::Label::new(
+                RichText::new(format!("[{note}]"))
+                    .small()
+                    .raised()
+                    .color(color),
+            )
+            .selectable(false)
+            .sense(Sense::click()),
         )
-        .selectable(false)
-        .sense(Sense::click()),
-    )
-    .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    if response.hovered() {
+        let y = response.rect.bottom() - 1.0;
+        ui.painter().line_segment(
+            [
+                egui::pos2(response.rect.left(), y),
+                egui::pos2(response.rect.right(), y),
+            ],
+            egui::Stroke::new(1.0, color),
+        );
+    }
+
+    response
 }
 
 pub fn footnote(ui: &mut Ui, text: &str) -> egui::Response {
@@ -146,17 +160,30 @@ pub fn footnote_backref(ui: &mut Ui) -> egui::Response {
 
     // Use plain U+21A9 only. Do NOT append U+FE0E:
     // some fallback fonts render the variation selector as a missing glyph.
-    ui.add(
-        egui::Label::new(
-            RichText::new("↩")
-                .small()
-                .color(color)
-                .underline(),
+    let response = ui
+        .add(
+            egui::Label::new(
+                RichText::new("↩")
+                    .small()
+                    .color(color),
+            )
+            .selectable(false)
+            .sense(Sense::click()),
         )
-        .selectable(false)
-        .sense(Sense::click()),
-    )
-    .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    if response.hovered() {
+        let y = response.rect.bottom() - 1.0;
+        ui.painter().line_segment(
+            [
+                egui::pos2(response.rect.left(), y),
+                egui::pos2(response.rect.right(), y),
+            ],
+            egui::Stroke::new(1.0, color),
+        );
+    }
+
+    response
 }
 
 fn height_body(ui: &Ui) -> f32 {
