@@ -1456,7 +1456,8 @@ impl CommonMarkViewerInternal {
                                                 })
                                                 .collect()
                                         };
-                                        body.heterogeneous_rows(heights.into_iter(), |mut row_ui| {
+                                        for height in heights {
+                                            body.row(height, |mut row_ui| {
                                             let row = &table_rows[row_ui.index()];
                                                 for col in row {
                                                     row_ui.col(|ui| {
@@ -1488,6 +1489,7 @@ impl CommonMarkViewerInternal {
                                                     });
                                                 }
                                         });
+                                        }
                                     });
                                 });
                             });
@@ -2365,7 +2367,8 @@ impl CommonMarkViewerInternal {
                                     })
                                     .collect()
                             };
-                            body.heterogeneous_rows(heights.into_iter(), |mut row_ui| {
+                            for height in heights {
+                                body.row(height, |mut row_ui| {
                                 let (is_header, row) = table_rows[row_ui.index()];
                                 for cell in row {
                                     row_ui.col(|ui| {
@@ -2385,6 +2388,7 @@ impl CommonMarkViewerInternal {
                                     });
                                 }
                             });
+                            }
                         });
                     });
                 });
