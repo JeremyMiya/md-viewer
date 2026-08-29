@@ -110,22 +110,53 @@ fn marker_center(rect: egui::Rect, raw: f32) -> egui::Pos2 {
 }
 
 #[inline]
-pub fn footnote_start(ui: &mut Ui, note: &str) {
-    ui.label(RichText::new(note).raised().strong().small());
+pub fn footnote_start(ui: &mut Ui, note: &str) -> egui::Response {
+    let color = ui.visuals().hyperlink_color;
+
+    ui.add(
+        egui::Label::new(
+            RichText::new(format!("[{note}]"))
+                .small()
+                .raised()
+                .color(color)
+                .underline(),
+        )
+        .selectable(false)
+        .sense(Sense::click()),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-pub fn footnote(ui: &mut Ui, text: &str) {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(width_body_space(ui) * 4.0, height_body(ui)),
-        Sense::hover(),
-    );
-    ui.painter().text(
-        rect.right_top(),
-        egui::Align2::RIGHT_TOP,
-        format!("{text}."),
-        TextStyle::Small.resolve(ui.style()),
-        ui.visuals().strong_text_color(),
-    );
+pub fn footnote(ui: &mut Ui, text: &str) -> egui::Response {
+    // Definition number stays on the normal body baseline.
+    let response = ui.label(RichText::new(format!("{text}.")));
+
+    // The root markdown flow intentionally has item_spacing.x == 0.
+    // Insert exactly one ordinary body-space between "1." and its content.
+    ui.add_space(width_body_space(ui));
+
+    response
+}
+
+pub fn footnote_backref(ui: &mut Ui) -> egui::Response {
+    // Exactly one ordinary space before the backlink.
+    ui.add_space(width_body_space(ui));
+
+    let color = ui.visuals().hyperlink_color;
+
+    // Use plain U+21A9 only. Do NOT append U+FE0E:
+    // some fallback fonts render the variation selector as a missing glyph.
+    ui.add(
+        egui::Label::new(
+            RichText::new("↩")
+                .small()
+                .color(color)
+                .underline(),
+        )
+        .selectable(false)
+        .sense(Sense::click()),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn height_body(ui: &Ui) -> f32 {

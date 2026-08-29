@@ -7,12 +7,27 @@ use egui::{self, Id, Pos2, TextStyle, Ui};
 
 use crate::List;
 use egui_commonmark_backend_extended::elements::{
-    blockquote, footnote, footnote_start, newline,
+    blockquote, footnote, footnote_backref, footnote_start, newline,
     paragraph_end_spacing, rule, soft_break, ImmutableCheckbox,
 };
 use egui_commonmark_backend_extended::misc::*;
 use egui_commonmark_backend_extended::pulldown::*;
 use pulldown_cmark::{CowStr, HeadingLevel};
+
+/// Internal target ID for one Markdown footnote.
+///
+/// A CommonMarkCache may be shared by multiple viewers, so namespace targets
+/// with the ScrollArea source ID whenever one is available.
+fn footnote_position_id(
+    source_id: Option<Id>,
+    kind: &'static str,
+    note: &str,
+) -> Id {
+    match source_id {
+        Some(source_id) => source_id.with(("footnote", kind, note)),
+        None => Id::new(("footnote", kind, note)),
+    }
+}
 
 /// Search-match highlight kind for a single rendered text segment.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -468,6 +483,13 @@ pub struct CommonMarkViewerInternal {
     current_heading_y: Option<f32>,
     current_heading_source_start: Option<usize>,
     current_heading_text: String,
+
+    /// Active Markdown footnote definition: label and marker screen-y.
+    current_footnote: Option<(String, f32)>,
+
+    /// Source ID of the renderer-owned ScrollArea. Used to namespace internal
+    /// navigation targets when one cache serves multiple documents.
+    current_source_id: Option<Id>,
 }
 
 pub(crate) struct CheckboxClickEvent {
@@ -495,6 +517,8 @@ impl CommonMarkViewerInternal {
             current_heading_y: None,
             current_heading_source_start: None,
             current_heading_text: String::new(),
+            current_footnote: None,
+            current_source_id: None,
         }
     }
 }
@@ -710,6 +734,8 @@ impl CommonMarkViewerInternal {
         text: &str,
         split_points_id: Option<Id>,
     ) -> (egui::InnerResponse<()>, Vec<CheckboxClickEvent>) {
+        self.current_source_id = split_points_id;
+
         let max_width = options.max_width(ui);
         let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
 
@@ -850,6 +876,19 @@ impl CommonMarkViewerInternal {
         pending_scroll_offset: Option<f32>,
         scroll_source: Option<egui::scroll_area::ScrollSource>,
     ) -> egui::scroll_area::ScrollAreaOutput<()> {
+        self.current_source_id = Some(source_id);
+
+        // Footnote navigation already has a content-relative target from
+        // the bootstrap render. It must NOT invalidate page_size/split_points.
+        //
+        // Keep caller pending_scroll_offset separate: outline/search jumps
+        // intentionally use the existing full-bootstrap correction path.
+        let internal_scroll_offset =
+            cache.take_internal_scroll_request();
+
+        let effective_scroll_offset =
+            pending_scroll_offset.or(internal_scroll_offset);
+
         let available_size = ui.available_size();
         let scroll_id = source_id.with("_scroll_area");
         let layout_sig = compute_layout_signature(ui, options);
@@ -930,6 +969,7 @@ impl CommonMarkViewerInternal {
         // scope above so `cache` is reborrowable.
         if layout_invalidated {
             cache.clear_header_positions();
+            cache.clear_internal_positions();
         }
 
         // Helper: build the renderer-owned ScrollArea with caller config.
@@ -937,7 +977,7 @@ impl CommonMarkViewerInternal {
             let mut sa = egui::ScrollArea::vertical()
                 .id_salt(scroll_id)
                 .auto_shrink([false, true]);
-            if let Some(offset) = pending_scroll_offset {
+            if let Some(offset) = effective_scroll_offset {
                 sa = sa.vertical_scroll_offset(offset);
             }
             if let Some(src) = scroll_source {
@@ -951,7 +991,9 @@ impl CommonMarkViewerInternal {
         // frames then paint only the viewport slice between clean boundaries.
         if scroll_cache(cache, &source_id).page_size.is_none() {
             let out = make_scroll_area().show(ui, |ui| {
-                cache.set_scroll_offset(pending_scroll_offset.unwrap_or(0.0));
+                cache.set_scroll_offset(
+                    effective_scroll_offset.unwrap_or(0.0),
+                );
                 self.show(ui, cache, options, text, Some(source_id));
 
                 // Leave a small scroll-safe area below the final rendered
@@ -1060,6 +1102,17 @@ impl CommonMarkViewerInternal {
                         .map(|(offset, event)| (offset + first_event_index, event))
                         .peekable();
 
+                    // Only event 0 is the real beginning of the Markdown
+                    // document. A virtualized slice starting later begins at
+                    // the recorded end position of a previous complete block,
+                    // so its first block must retain normal start-newline
+                    // semantics. Treating every slice as document start shifts
+                    // the whole slice upward and causes visible jumps whenever
+                    // scrolling crosses a split point.
+                    if first_event_index > 0 {
+                        self.line.should_not_start_newline_forced = false;
+                    }
+
                     while let Some((index, (event, src_span))) = events.next() {
                         if events.peek().is_none() {
                             self.line.should_end_newline_forced = false;
@@ -1081,7 +1134,10 @@ impl CommonMarkViewerInternal {
                         // space instead, which is why a table rendered
                         // horizontally offset from where the bootstrap
                         // measured it.
-                        if index == first_event_index {
+                        // Match the full bootstrap pass exactly: only
+                        // the real first document event gets the special
+                        // no-leading-newline treatment.
+                        if index == 0 {
                             self.line.should_not_start_newline_forced = false;
                         }
                     }
@@ -1531,7 +1587,42 @@ impl CommonMarkViewerInternal {
                 self.html_block.push_str(&text);
             }
             pulldown_cmark::Event::FootnoteReference(footnote) => {
-                footnote_start(ui, &footnote);
+                let reference_id =
+                    footnote_position_id(self.current_source_id, "ref", &footnote);
+
+                let response = footnote_start(ui, &footnote)
+                    .on_hover_text(format!("Go to footnote {footnote}"));
+
+                // Full bootstrap rendering records this first. Virtualized
+                // viewport paints use if_absent so repeated slices cannot
+                // replace the stable document-relative position.
+                let content_y =
+                    response.rect.top() - ui.min_rect().top();
+                cache.record_internal_content_y_if_absent(
+                    reference_id,
+                    content_y,
+                );
+
+                if response.clicked() {
+                    let definition_id =
+                        footnote_position_id(
+                            self.current_source_id,
+                            "def",
+                            &footnote,
+                        );
+
+                    if let Some(target_y) =
+                        cache.get_internal_content_y(definition_id)
+                    {
+                        // Leave one body line of context above the target.
+                        let context =
+                            ui.text_style_height(&TextStyle::Body);
+                        cache.request_internal_scroll(
+                            (target_y - context).max(0.0),
+                        );
+                        ui.ctx().request_repaint();
+                    }
+                }
             }
             pulldown_cmark::Event::SoftBreak => {
                 soft_break(ui);
@@ -1887,7 +1978,10 @@ impl CommonMarkViewerInternal {
 
                 self.line.should_start_newline = false;
                 self.line.should_end_newline = false;
-                footnote(ui, &note);
+
+                let response = footnote(ui, &note);
+                self.current_footnote =
+                    Some((note.to_string(), response.rect.top()));
             }
             pulldown_cmark::Tag::Table(_) => {
                 self.is_table = true;
@@ -1950,8 +2044,16 @@ impl CommonMarkViewerInternal {
         match tag {
             pulldown_cmark::TagEnd::Paragraph => {
                 self.line.try_insert_end(ui);
-                // Add extra paragraph spacing if configured
-                paragraph_end_spacing(ui, &options.typography);
+
+                // FootnoteDefinition deliberately keeps its first paragraph
+                // in the same inline row as "1.". paragraph_end_spacing()
+                // ultimately calls ui.add_space(); in this renderer's
+                // left-to-right root layout that advances X rather than Y,
+                // creating a large horizontal gap before the backlink.
+                if self.current_footnote.is_none() {
+                    // Add extra paragraph spacing if configured.
+                    paragraph_end_spacing(ui, &options.typography);
+                }
             }
             pulldown_cmark::TagEnd::Heading { .. } => {
                 // Record under a source-stable key shared with the Outline parser.
@@ -2028,6 +2130,49 @@ impl CommonMarkViewerInternal {
             }
             pulldown_cmark::TagEnd::Item => {}
             pulldown_cmark::TagEnd::FootnoteDefinition => {
+                if let Some((note, marker_y)) =
+                    self.current_footnote.take()
+                {
+                    let definition_id =
+                        footnote_position_id(
+                            self.current_source_id,
+                            "def",
+                            &note,
+                        );
+
+                    let content_y =
+                        marker_y - ui.min_rect().top();
+                    cache.record_internal_content_y_if_absent(
+                        definition_id,
+                        content_y,
+                    );
+
+                    let response = footnote_backref(ui)
+                        .on_hover_text(format!(
+                            "Back to footnote reference {note}"
+                        ));
+
+                    if response.clicked() {
+                        let reference_id =
+                            footnote_position_id(
+                                self.current_source_id,
+                                "ref",
+                                &note,
+                            );
+
+                        if let Some(target_y) =
+                            cache.get_internal_content_y(reference_id)
+                        {
+                            let context =
+                                ui.text_style_height(&TextStyle::Body);
+                            cache.request_internal_scroll(
+                                (target_y - context).max(0.0),
+                            );
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                }
+
                 self.line.should_start_newline = true;
                 self.line.should_end_newline = true;
                 self.line.try_insert_end(ui);

@@ -2116,6 +2116,15 @@ pub struct CommonMarkCache {
     /// Current scroll offset, set before rendering to calculate content-relative positions.
     current_scroll_offset: f32,
 
+    /// Content-relative positions for non-heading internal document targets,
+    /// currently used by Markdown footnote references and definitions.
+    internal_positions: HashMap<egui::Id, f32>,
+
+    /// A renderer-generated internal navigation request. Footnote clicks occur
+    /// while the renderer-owned ScrollArea is already painting, so the target
+    /// offset is consumed by show_scrollable on the following frame.
+    pending_internal_scroll_offset: Option<f32>,
+
     /// Byte ranges of search matches in the source content. Renderer paints a background
     /// color on overlapping text events. Sorted ascending by start.
     search_ranges: Vec<std::ops::Range<usize>>,
@@ -2219,6 +2228,8 @@ impl Default for CommonMarkCache {
             has_installed_loaders: false,
             header_positions: HashMap::new(),
             current_scroll_offset: 0.0,
+            internal_positions: HashMap::new(),
+            pending_internal_scroll_offset: None,
             search_ranges: Vec::new(),
             active_search_range: None,
             active_search_y: None,
@@ -2397,6 +2408,35 @@ impl CommonMarkCache {
     /// This is used to calculate content-relative header positions.
     pub fn set_scroll_offset(&mut self, offset: f32) {
         self.current_scroll_offset = offset;
+    }
+
+    /// Record the first measured content-relative position for an internal
+    /// document target. Bootstrap rendering visits the complete document;
+    /// later virtualized slices must not overwrite that stable position.
+    pub fn record_internal_content_y_if_absent(
+        &mut self,
+        id: egui::Id,
+        content_y: f32,
+    ) {
+        self.internal_positions.entry(id).or_insert(content_y);
+    }
+
+    pub fn get_internal_content_y(&self, id: egui::Id) -> Option<f32> {
+        self.internal_positions.get(&id).copied()
+    }
+
+    pub fn clear_internal_positions(&mut self) {
+        self.internal_positions.clear();
+    }
+
+    /// Defer an internal-document jump until the next renderer-owned
+    /// ScrollArea frame.
+    pub fn request_internal_scroll(&mut self, content_y: f32) {
+        self.pending_internal_scroll_offset = Some(content_y.max(0.0));
+    }
+
+    pub fn take_internal_scroll_request(&mut self) -> Option<f32> {
+        self.pending_internal_scroll_offset.take()
     }
 
     /// Record the y-position of a header for scroll navigation.

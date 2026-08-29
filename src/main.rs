@@ -4629,7 +4629,19 @@ impl eframe::App for MarkdownApp {
                     tab.last_content_height,
                     action,
                 );
-                tab.pending_scroll_offset = Some(target);
+
+                // Keyboard scrolling is an ordinary viewport movement.
+                //
+                // Do not use `pending_scroll_offset` here: the renderer treats
+                // that as a heavyweight outline/search jump and deliberately
+                // invalidates `page_size`, forcing a full-document bootstrap.
+                // Doing that for every ArrowUp/ArrowDown/PageUp/PageDown caused
+                // visible one-frame jumps and could corrupt the measured
+                // document extent near the bottom.
+                //
+                // The direct internal-scroll path preserves the already-valid
+                // page_size and viewport split points.
+                tab.cache.request_internal_scroll(target);
             }
         }
 
